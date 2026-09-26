@@ -27,28 +27,26 @@ while True:
     
     # 1. Agregamos el mensaje del usuario al historial
     agent.messages.append({"role": "user", "content": user_input})
-    
-    # 2. RAG de Herramientas: Laya decide la lista de herramientas permitidas
-    # Aquí se imprimen los veredictos individuales gracias al cambio en agent.py
-    active_tools = agent.get_relevant_tools(user_input)
-    
-    # --- NUEVO PRINT DE DEBUG ---
-    nombres_tools = [t['function']['name'] for t in active_tools]
-    print(f"  🛠️ [DEBUG] Enviando al modelo las herramientas: {nombres_tools if nombres_tools else 'Ninguna'}")
-    
+
+    # 2. Limpiar tools descubiertas del turno anterior
+    agent.discovered_tools = []
+
     # --- BUCLE 2: Interacción Modelo <-> Herramientas ---
     while True:
-        # 3. Preparamos los argumentos para la API
+        # 3. Obtener tools activas (core + descubiertas por search_tools)
+        active_tools = agent.get_active_tools()
+
+        nombres_tools = [t['function']['name'] for t in active_tools]
+        print(f"  🛠️ [DEBUG] Tools disponibles: {nombres_tools}")
+
+        # 4. Preparamos los argumentos para la API
         kwargs = {
             "model": "Bonsai-27b-Q1_0",
-            "messages": agent.messages
+            "messages": agent.messages,
+            "tools": active_tools
         }
-        
-        # Solo inyectamos "tools" si Laya aprobó al menos una
-        if active_tools:
-            kwargs["tools"] = active_tools
 
-        # Llamamos al modelo desempaquetando los argumentos dinámicos
+        # Llamamos al modelo
         response = client.chat.completions.create(**kwargs)
         
         # El procesamiento de la respuesta (ver si llamó tool o dio texto final)
@@ -57,4 +55,4 @@ while True:
         # Si NO se llamó ninguna herramienta, tenemos la respuesta final
         if not called_tool:
             print("Jarvis:", response.choices[0].message.content)
-            break # Rompe este bucle 2 y vuelve a pedirte input en el bucle 1
+            break  # Vuelve a pedirte input en el bucle 1
