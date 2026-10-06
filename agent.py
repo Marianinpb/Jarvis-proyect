@@ -33,7 +33,7 @@ class Agent:
         ]
         
         print("Cargando motor lógico de Jarvis...")
-        self.laya_router = Router(preload=True)
+        self.laya_router = Router(models={"english": "Marianinpb/laya-toolrag-router"}, default="english", preload=True)
 
         # Tools descubiertas por search_tools en el turno actual
         self.discovered_tools = []
@@ -201,6 +201,40 @@ class Agent:
                         "required": ["recipe_name"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_terminal_command",
+                    "description": "Executes a command in the system terminal (command prompt/shell) and returns the output. Use this to run scripts, install packages, or perform system operations.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command to execute in the terminal."
+                            }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Performs a web search to find information on the internet. Returns a list of relevant URLs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query."
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
             }
         ]
 
@@ -274,7 +308,7 @@ class Agent:
         }
 
         try:
-            result = self.laya_router.predict(state, questions, model="laya")
+            result = self.laya_router.predict(state, questions)
             match_ans = result.get("answers", {}).get("match", {})
             probabilities = match_ans.get("probabilities", {})
         except Exception as e:
@@ -283,6 +317,9 @@ class Agent:
 
         THRESHOLD = 0.05
         found = []
+        
+        # Restablecemos la lista en cada iteración de búsqueda para no acumular
+        self.discovered_tools = []
 
         for desc, prob in probabilities.items():
             if desc == "none of the above":
@@ -461,6 +498,32 @@ class Agent:
             print(f"    ✅ Paso {i+1} completado.")
 
         return {"status": f"Receta '{recipe_name}' ejecutada ({len(step_results)} pasos).", "results": step_results}
+
+    def run_terminal_command(self, command):
+        print(f"  ⚙️ Ejecutando: run_terminal_command({command})")
+        try:
+            import subprocess
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def web_search(self, query):
+        print(f"  ⚙️ Ejecutando: web_search({query})")
+        try:
+            try:
+                from googlesearch import search
+            except ImportError:
+                return {"error": "El paquete 'googlesearch-python' no está instalado. Ejecuta 'pip install googlesearch-python' en la terminal (usando run_terminal_command o manualmente) para usar esta herramienta."}
+            
+            results = list(search(query, num_results=5, lang="es"))
+            return {"results": results}
+        except Exception as e:
+            return {"error": str(e)}
         
     def process_response(self, response):
         message = response.choices[0].message
@@ -497,6 +560,10 @@ class Agent:
                         result = self.run_recipe(**args)
                     elif fn_name == "search_tools":
                         result = self.search_tools(**args)
+                    elif fn_name == "run_terminal_command":
+                        result = self.run_terminal_command(**args)
+                    elif fn_name == "web_search":
+                        result = self.web_search(**args)
                     # RUTEADOR DINÁMICO: tools descubiertas o de tools.py
                     elif hasattr(tools, fn_name):
                         try:

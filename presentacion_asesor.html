@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Presentación: Jev, Laya y Simula</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;500;700;900&display=swap');
+        
+        :root {
+            --bg-color: #0b0f19;
+            --text-color: #e2e8f0;
+            --primary: #3b82f6;
+            --accent: #8b5cf6;
+            --glass-bg: rgba(17, 24, 39, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.1);
+        }
+
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            font-family: 'Inter', sans-serif;
+            background: radial-gradient(circle at top right, #1e1b4b, var(--bg-color));
+            color: var(--text-color);
+            overflow: hidden;
+        }
+
+        .presentation {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            transform: translateY(50px) scale(0.95);
+            transition: all 0.8s cubic-bezier(0.25, 1, 0.5, 1);
+            pointer-events: none;
+            padding: 2rem;
+            box-sizing: border-box;
+        }
+
+        .slide.active {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            pointer-events: auto;
+        }
+
+        .glass-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 4rem 5rem;
+            max-width: 1000px;
+            width: 100%;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: float 6s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+            100% { transform: translateY(0px); }
+        }
+
+        h1 {
+            font-size: 4.5rem;
+            font-weight: 900;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, #60a5fa, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+        }
+
+        h2 {
+            font-size: 2.8rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            color: #fff;
+            border-bottom: 2px solid var(--primary);
+            display: inline-block;
+            padding-bottom: 0.5rem;
+        }
+
+        p, li {
+            font-size: 1.35rem;
+            line-height: 1.8;
+            color: #cbd5e1;
+            margin-bottom: 1rem;
+        }
+
+        ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        li {
+            position: relative;
+            padding-left: 2.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        li::before {
+            content: "✦";
+            position: absolute;
+            left: 0;
+            color: var(--accent);
+            font-size: 1.4rem;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 1.5rem;
+            z-index: 100;
+        }
+
+        .btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 14px 28px;
+            border-radius: 50px;
+            font-size: 1.1rem;
+            font-weight: 500;
+            cursor: pointer;
+            backdrop-filter: blur(5px);
+            transition: all 0.3s ease;
+        }
+
+        .btn:hover:not(:disabled) {
+            background: rgba(255, 255, 255, 0.15);
+            transform: scale(1.05);
+            box-shadow: 0 0 15px rgba(139, 92, 246, 0.5);
+        }
+
+        .btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2.5rem;
+        }
+
+        .feature-box {
+            background: rgba(255,255,255,0.03);
+            padding: 1.8rem;
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: transform 0.3s;
+        }
+        
+        .feature-box:hover {
+            transform: translateY(-5px);
+            background: rgba(255,255,255,0.06);
+            border-color: rgba(139, 92, 246, 0.3);
+        }
+
+        .badge {
+            background: rgba(59, 130, 246, 0.2);
+            color: #93c5fd;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 1rem;
+            font-weight: bold;
+            display: inline-block;
+            margin-bottom: 15px;
+        }
+        
+        .progress-bar {
+            position: absolute;
+            top: 0;
+            left: 0;
+            height: 6px;
+            background: linear-gradient(90deg, var(--primary), var(--accent));
+            width: 0%;
+            transition: width 0.5s ease;
+            z-index: 1000;
+        }
+
+        .fade-in {
+            animation: fadeIn 1s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="progress-bar" id="progress"></div>
+
+    <div class="presentation">
+        <!-- Slide 1: Inicio -->
+        <div class="slide active">
+            <div class="glass-card" style="text-align: center;">
+                <h1>Decisiones Estructuradas en IA</h1>
+                <p style="font-size: 1.8rem; font-weight: 300;">Explorando Jev, Laya y Simula</p>
+                <div style="margin-top: 3rem;">
+                    <span class="badge">Modelos Sistema 1</span>
+                    <span class="badge">Enrutamiento (Routing)</span>
+                    <span class="badge">Generación de Datasets</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 2: Jev -->
+        <div class="slide">
+            <div class="glass-card">
+                <span class="badge" style="background: rgba(139, 92, 246, 0.2); color: #c4b5fd;">El Precursor</span>
+                <h2>¿Qué es Jev?</h2>
+                <p class="fade-in">Antes de sumergirnos en Laya, es vital comprender el concepto detrás de <strong>Jev</strong>. Creado por TypeSafe AI, Jev es un modelo fundamental diseñado para operar como un <em>"Sistema 1"</em> de decisiones.</p>
+                <div class="grid" style="margin-top: 2rem;">
+                    <div class="feature-box fade-in" style="animation-delay: 0.2s; animation-fill-mode: both;">
+                        <strong style="color: white; font-size: 1.4rem;">Operación por Difusión (Sin Retroalimentación)</strong>
+                        <p style="font-size: 1.1rem; margin-top: 0.8rem;">A diferencia de los LLMs clásicos, estos modelos <strong>no tienen retroalimentación</strong> (no son autoregresivos). Operan por difusión, lo que significa que no evalúan ni generan los resultados token por token, sino que emiten la decisión estructurada en un solo paso.</p>
+                    </div>
+                    <div class="feature-box fade-in" style="animation-delay: 0.4s; animation-fill-mode: both;">
+                        <strong style="color: white; font-size: 1.4rem;">Limitaciones Propietarias</strong>
+                        <p style="font-size: 1.1rem; margin-top: 0.8rem;">Es una API de código cerrado con cobro por token, lo que dificulta la privacidad total y despliegues masivos locales.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 3: Laya -->
+        <div class="slide">
+            <div class="glass-card">
+                <span class="badge">La Evolución Open-Source</span>
+                <h2>Entra Laya</h2>
+                <p>Nacido como la alternativa abierta a Jev, <strong>Laya</strong> (de Convai Innovations) democratiza el acceso a los modelos de decisión de Sistema 1, permitiendo un control total.</p>
+                <ul style="margin-top: 1.5rem;">
+                    <li class="fade-in" style="animation-delay: 0.1s; animation-fill-mode: both;"><strong>Clasificación Zero-Shot:</strong> Traduce intenciones en lenguaje natural a acciones precisas o selección de herramientas.</li>
+                    <li class="fade-in" style="animation-delay: 0.2s; animation-fill-mode: both;"><strong>Modelo de Difusión:</strong> Al igual que Jev, Laya no tiene retroalimentación ni evalúa uno a uno los tokens. Procesa la entrada y "difunde" la clasificación directamente.</li>
+                    <li class="fade-in" style="animation-delay: 0.3s; animation-fill-mode: both;"><strong>Velocidad Extrema:</strong> Gracias a esta arquitectura sin retroalimentación, responde en tan solo ~32ms, ideal para <em>enrutamiento dinámico</em>.</li>
+                    <li class="fade-in" style="animation-delay: 0.4s; animation-fill-mode: both;"><strong>Self-Hosted y Gratuito:</strong> Licencia Apache 2.0; se ejecuta en tu propio hardware sin pagar APIs.</li>
+                    <li class="fade-in" style="animation-delay: 0.5s; animation-fill-mode: both;"><strong>Rol en el Agente:</strong> Se encarga de decidir qué herramienta del <code>toolrag</code> debe usar el Agente antes de generar una respuesta.</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Slide 4: Simula -->
+        <div class="slide">
+            <div class="glass-card">
+                <span class="badge" style="background: rgba(16, 185, 129, 0.2); color: #6ee7b7;">Framework Sintético</span>
+                <h2>¿Qué es Simula?</h2>
+                <p>Para que modelos como Laya funcionen perfectamente, necesitan datos de alta calidad. <strong>Simula</strong> es el CLI-framework diseñado para generarlos.</p>
+                <div class="grid" style="margin-top: 2rem;">
+                    <div class="feature-box">
+                        <strong style="color: white; font-size: 1.4rem;">Cobertura por Taxonomías</strong>
+                        <p style="font-size: 1.1rem; margin-top: 0.8rem;">No solo genera datos al azar; mapea todo el espacio conceptual de tu problema para garantizar variedad sistemática.</p>
+                    </div>
+                    <div class="feature-box">
+                        <strong style="color: white; font-size: 1.4rem;">Datos Estructurados (JSON)</strong>
+                        <p style="font-size: 1.1rem; margin-top: 0.8rem;">Orquesta a LLMs (usando roles como "bulk" y "critic") para generar y validar salidas que cumplan esquemas estrictos de YAML/JSON.</p>
+                    </div>
+                </div>
+                <p style="margin-top: 2rem; font-size: 1.2rem; border-left: 4px solid var(--primary); padding-left: 1rem;"><em>Utilizado para generar nuestro dataset de entrenamiento y pruebas (p.ej. <code>laya_dataset.yaml</code>).</em></p>
+            </div>
+        </div>
+
+        <!-- Slide 5: Conclusión -->
+        <div class="slide">
+            <div class="glass-card">
+                <span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fcd34d;">Visión General</span>
+                <h2>El Flujo de Trabajo</h2>
+                <ul style="margin-top: 2rem;">
+                    <li><strong>El Origen (Jev):</strong> Introdujo el concepto de modelos de toma de decisión rápida, pero era restrictivo.</li>
+                    <li><strong>El Motor (Laya):</strong> Nos provee la capacidad real y libre (Open-Source) de enrutar intenciones a herramientas en tiempo real para el Agente Jarvis.</li>
+                    <li><strong>El Combustible (Simula):</strong> Es la fábrica que produce los datasets de entrenamiento precisos necesarios para que Laya sea infalible.</li>
+                </ul>
+                <div style="text-align: center; margin-top: 3rem;">
+                    <h3 style="color: white; font-size: 2rem; background: linear-gradient(135deg, #60a5fa, #c084fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">¿Dudas o Preguntas?</h3>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button class="btn" id="prevBtn" disabled>&#8592; Anterior</button>
+        <button class="btn" id="nextBtn">Siguiente &#8594;</button>
+    </div>
+
+    <script>
+        const slides = document.querySelectorAll('.slide');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const progressBar = document.getElementById('progress');
+        let currentSlide = 0;
+
+        function updateSlides() {
+            slides.forEach((slide, index) => {
+                if (index === currentSlide) {
+                    slide.classList.add('active');
+                } else {
+                    slide.classList.remove('active');
+                }
+            });
+
+            prevBtn.disabled = currentSlide === 0;
+            nextBtn.disabled = currentSlide === slides.length - 1;
+            
+            const progressPercentage = ((currentSlide) / (slides.length - 1)) * 100;
+            progressBar.style.width = progressPercentage + '%';
+        }
+
+        prevBtn.addEventListener('click', () => {
+            if (currentSlide > 0) {
+                currentSlide--;
+                updateSlides();
+            }
+        });
+
+        nextBtn.addEventListener('click', () => {
+            if (currentSlide < slides.length - 1) {
+                currentSlide++;
+                updateSlides();
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'Space') {
+                if (currentSlide < slides.length - 1) {
+                    currentSlide++;
+                    updateSlides();
+                }
+            } else if (e.key === 'ArrowLeft') {
+                if (currentSlide > 0) {
+                    currentSlide--;
+                    updateSlides();
+                }
+            }
+        });
+        
+        updateSlides();
+    </script>
+</body>
+</html>
