@@ -32,7 +32,7 @@ echo -e "${GREEN}✓ Ejecutando instalación como root (solicitado por ${REAL_US
 # 2. Instalar dependencias base del sistema
 echo -e "\n${BLUE}[1/7] Verificando dependencias del sistema...${NC}"
 if command -v apt-get &> /dev/null; then
-    apt-get update -qq
+    apt-get update -qq || true
     apt-get install -y -qq git curl python3 python3-venv python3-pip
 elif command -v dnf &> /dev/null; then
     dnf install -y git curl python3 python3-pip
@@ -79,6 +79,7 @@ fi
 
 # 4. Clonar o actualizar repositorio en /opt/celab-bot
 echo -e "\n${BLUE}[3/7] Descargando código en ${INSTALL_DIR}...${NC}"
+git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo -e "${YELLOW}El directorio ya existe. Sincronizando con git fetch & reset...${NC}"
     git -C "$INSTALL_DIR" fetch origin
