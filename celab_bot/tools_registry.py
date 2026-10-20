@@ -5,7 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from celab_bot.users import get_user_home
+from celab_bot.users import get_user_home, get_user_data_dir
+
 
 
 class ToolsRegistry:
@@ -223,10 +224,10 @@ class ToolsRegistry:
         ]
 
     def get_user_dirs(self, linux_user: str) -> Tuple[Path, Path]:
-        """Devuelve (user_tools_dir, user_recipes_dir) en el home del usuario."""
-        home = get_user_home(linux_user)
-        base = home / ".celab-bot"
+        """Devuelve (user_tools_dir, user_recipes_dir) en users_data del usuario."""
+        base = get_user_data_dir(linux_user)
         return base / "tools", base / "recipes"
+
 
     def load_dynamic_tools_and_recipes(self, linux_user: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
@@ -258,23 +259,27 @@ class ToolsRegistry:
                     pass
 
         # 2. Herramientas y recetas personales
-        user_tools_dir, user_recipes_dir = self.get_user_dirs(linux_user)
-        if user_tools_dir.is_dir():
-            for f in user_tools_dir.glob("*.json"):
-                try:
-                    with open(f, "r", encoding="utf-8") as fp:
-                        schema = json.load(fp)
-                        tools_map[schema["function"]["name"]] = schema
-                except Exception:
-                    pass
+        try:
+            user_tools_dir, user_recipes_dir = self.get_user_dirs(linux_user)
+            if user_tools_dir.is_dir():
+                for f in user_tools_dir.glob("*.json"):
+                    try:
+                        with open(f, "r", encoding="utf-8") as fp:
+                            schema = json.load(fp)
+                            tools_map[schema["function"]["name"]] = schema
+                    except Exception:
+                        pass
 
-        if user_recipes_dir.is_dir():
-            for f in user_recipes_dir.glob("*.json"):
-                try:
-                    with open(f, "r", encoding="utf-8") as fp:
-                        recipe = json.load(fp)
-                        recipes_map[recipe["name"]] = recipe
-                except Exception:
-                    pass
+            if user_recipes_dir.is_dir():
+                for f in user_recipes_dir.glob("*.json"):
+                    try:
+                        with open(f, "r", encoding="utf-8") as fp:
+                            recipe = json.load(fp)
+                            recipes_map[recipe["name"]] = recipe
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         return list(tools_map.values()), recipes_map
+

@@ -2,11 +2,11 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
-from celab_bot.users import get_user_home
+from celab_bot.users import get_user_data_dir
 
 
 class UserMemoryStore:
-    """Gestiona la memoria a largo plazo individual en el $HOME de cada usuario Linux."""
+    """Gestiona la memoria a largo plazo individual aislada en /opt/celab-bot/users_data/<usuario>."""
 
     CATEGORIES = [
         "user_preferences",
@@ -18,9 +18,14 @@ class UserMemoryStore:
     def __init__(self, linux_user: str, base_dir: Optional[Path] = None):
         self.linux_user = linux_user
         if base_dir:
-            self.user_dir = base_dir / ".celab-bot"
+            self.user_dir = base_dir
         else:
-            self.user_dir = get_user_home(linux_user) / ".celab-bot"
+            self.user_dir = get_user_data_dir(linux_user) / "memory"
+
+        try:
+            self.user_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
         self.file_path = self.user_dir / "memory_store.json"
         self.store: Dict[str, List[str]] = {cat: [] for cat in self.CATEGORIES}
@@ -28,10 +33,10 @@ class UserMemoryStore:
 
     def load(self) -> Dict[str, List[str]]:
         """Carga la memoria del usuario desde su archivo personal."""
-        if not self.file_path.is_file():
-            return self.store
-
         try:
+            if not self.file_path.is_file():
+                return self.store
+
             with open(self.file_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
                 for cat in self.CATEGORIES:
@@ -41,6 +46,7 @@ class UserMemoryStore:
             print(f"⚠️ [MEMORY] Error leyendo memoria para {self.linux_user}: {e}")
 
         return self.store
+
 
     def save(self) -> bool:
         """Guarda la memoria en disco asegurando permisos de usuario."""

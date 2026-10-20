@@ -10,7 +10,8 @@ from celab_bot.config import CelabConfig
 from celab_bot.memory import UserMemoryStore
 from celab_bot.security import requires_user_confirmation
 from celab_bot.tools_registry import ToolsRegistry
-from celab_bot.users import get_user_home
+from celab_bot.users import get_user_home, get_user_data_dir
+
 
 
 class AgentEngine:
@@ -379,7 +380,7 @@ class AgentEngine:
             params = args.get("parameters")
             code = args.get("code")
 
-            target_dir = self.config.shared_dir / "tools" if scope == "general" else home / ".celab-bot" / "tools"
+            target_dir = self.config.shared_dir / "tools" if scope == "general" else get_user_data_dir(linux_user) / "tools"
             target_dir.mkdir(parents=True, exist_ok=True)
 
             schema = {
@@ -407,8 +408,9 @@ class AgentEngine:
                 return {"error": "Solo administradores pueden crear recetas con scope 'general'."}
 
             name = args.get("name")
-            target_dir = self.config.shared_dir / "recipes" if scope == "general" else home / ".celab-bot" / "recipes"
+            target_dir = self.config.shared_dir / "recipes" if scope == "general" else get_user_data_dir(linux_user) / "recipes"
             target_dir.mkdir(parents=True, exist_ok=True)
+
 
             recipe_data = {
                 "name": name,

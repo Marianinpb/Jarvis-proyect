@@ -83,8 +83,14 @@ def link_user(openwebui_id: str, linux_user: str, path: Optional[Path] = None) -
     users[openwebui_id] = linux_user
     ok = save_users(users, path)
     if ok:
+        # Inicializar automáticamente carpetas de datos del usuario
+        try:
+            get_user_data_dir(linux_user)
+        except Exception:
+            pass
         return True, f"Vinculado '{openwebui_id}' -> '{linux_user}' con éxito."
     return False, "Error al escribir el archivo de usuarios."
+
 
 
 def unlink_user(openwebui_id: str, path: Optional[Path] = None) -> Tuple[bool, str]:
@@ -158,3 +164,19 @@ def get_user_home(linux_user: str) -> Path:
     
     # En desarrollo local Windows, simular bajo su directorio actual o usuario actual
     return Path.home()
+
+
+def get_user_data_dir(linux_user: str) -> Path:
+    """Devuelve el directorio de datos aislados del usuario bajo /opt/celab-bot/users_data."""
+    if os.name == "posix" and Path("/opt/celab-bot").exists():
+        base = Path("/opt/celab-bot/users_data") / linux_user
+    else:
+        base = Path("./users_data").resolve() / linux_user
+
+    for sub in ["tools", "recipes", "memory"]:
+        try:
+            (base / sub).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    return base
+

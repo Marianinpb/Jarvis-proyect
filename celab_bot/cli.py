@@ -65,11 +65,32 @@ def cmd_restart(args):
 def cmd_update(args):
     root_dir = Path(__file__).resolve().parent.parent
     print("🚀 Actualizando CELab bot desde GitHub...")
-    subprocess.run(["git", "pull", "--ff-only"], cwd=str(root_dir))
-    subprocess.run(["uv", "pip", "install", "-e", "."], cwd=str(root_dir))
+    subprocess.run(["git", "config", "--global", "--add", "safe.directory", str(root_dir)], cwd=str(root_dir))
+    subprocess.run(["git", "fetch", "origin"], cwd=str(root_dir))
+    res = subprocess.run(["git", "reset", "--hard", "origin/master"], cwd=str(root_dir))
+    if res.returncode != 0:
+        subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=str(root_dir))
+
+    venv_dir = root_dir / "venv"
+    import shutil
+    uv_bin = None
+    for cand in ["uv", str(Path.home() / ".local" / "bin" / "uv"), "/root/.local/bin/uv"]:
+        if shutil.which(cand) or Path(cand).is_file():
+            uv_bin = cand
+            break
+
+    if uv_bin and venv_dir.is_dir():
+        subprocess.run([uv_bin, "pip", "install", "--python", str(venv_dir), "-e", "."], cwd=str(root_dir))
+    elif venv_dir.is_dir() and (venv_dir / "bin" / "pip").is_file():
+        subprocess.run([str(venv_dir / "bin" / "pip"), "install", "-e", "."], cwd=str(root_dir))
+
+    if os.name == "posix":
+        subprocess.run(["chown", "-R", "celab-bot:celab-users", str(root_dir)])
+
     print("🔄 Reiniciando servicio...")
     subprocess.run(["systemctl", "restart", "celab-bot.service"])
-    print("✅ Actualización completada.")
+    print("✅ Actualización completada con éxito.")
+
 
 
 def cmd_serve(args):
