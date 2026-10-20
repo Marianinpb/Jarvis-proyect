@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "celab-bot"
+version = "2.0.0"
+description = "CELab bot: Multi-user AI agent with Laya router for the lab server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.12.0",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.5.0",
+    "googlesearch-python>=1.2.3",
+    "huggingface_hub>=0.20.0",
+]
+
+[project.optional-dependencies]
+laya = [
+    "laya>=0.1.0",
+    "torch>=2.1.0",
+    "safetensors>=0.4.0",
+    "transformers>=4.36.0",
+]
+
+[project.scripts]
+celab-bot = "celab_bot.cli:main"
+celab-exec = "celab_bot.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["celab_bot*"]

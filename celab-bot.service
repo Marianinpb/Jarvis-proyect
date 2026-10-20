@@ -1,0 +1,23 @@
+[Unit]
+Description=CELab Bot - AI Agent Service for Lab
+After=network.target
+
+[Service]
+Type=simple
+User=celab-bot
+Group=celab-users
+WorkingDirectory=/opt/celab-bot
+ExecStart=/opt/celab-bot/venv/bin/celab-bot serve --config /etc/celab-bot/config.toml
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+
+# Seguridad del servicio
+NoNewPrivileges=no
+ProtectSystem=full
+ProtectHome=no
+ReadWritePaths=/opt/celab-bot /etc/celab-bot /tmp
+
+[Install]
+WantedBy=multi-user.target

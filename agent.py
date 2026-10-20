@@ -22,21 +22,41 @@ class Agent:
         self.messages = [
             {"role": "system", "content": (
                 "Eres Jarvis, un asistente de IA avanzado. "
-                "Tu ÚNICA herramienta inicial es search_tools. "
-                "SIEMPRE que el usuario te pida algo, PRIMERO llama search_tools con una descripción "
-                "EN INGLÉS de lo que necesitas hacer. Ejemplo: si te piden listar archivos, llama "
-                "search_tools(query='list files in directory'). Si te piden la hora, llama "
-                "search_tools(query='get current system time'). "
-                "search_tools te devolverá las herramientas disponibles que podrás usar en tu siguiente turno. "
-                "NUNCA digas que no puedes hacer algo sin antes buscar con search_tools."
+                "Tienes la capacidad de buscar herramientas usando search_tools. "
+                "Usa search_tools con una descripción EN INGLÉS ÚNICAMENTE cuando la tarea requiera "
+                "interactuar con el sistema (archivos, terminal, clima, recetas o herramientas externas). "
+                "Ejemplo: si te piden listar archivos, llama search_tools(query='list files in directory'). "
+                "Para conversaciones generales, saludos, preguntas sobre ti o sobre el usuario y el historial del chat, "
+                "responde directamente sin llamar a search_tools."
             )}
         ]
         
         print("Cargando motor lógico de Jarvis...")
         self.laya_router = Router(models={"english": "Marianinpb/laya-toolrag-router"}, default="english", preload=True)
+        self.context_router = Router(models={"english": "Marianinpb/laya-context-router"}, default="english", preload=True)
 
         # Tools descubiertas por search_tools en el turno actual
         self.discovered_tools = []
+        
+        # Cache de traducciones para Laya (evita retraducir mensajes previos)
+        self._translation_cache = {}
+        
+        # ═══════════════════════════════════════════════════════════════
+        # LONG-TERM MEMORY STORE
+        # ═══════════════════════════════════════════════════════════════
+        self.memory_store = {
+            "user_preferences": [],
+            "project_context": [],
+            "general_knowledge": [],
+            "conversational_context": []
+        }
+        if os.path.exists("memory_store.json"):
+            with open("memory_store.json", "r", encoding="utf-8") as f:
+                try:
+                    loaded = json.load(f)
+                    self.memory_store.update(loaded)
+                except json.JSONDecodeError:
+                    pass
     
     def setup_tools(self):
         # ═══════════════════════════════════════════════════════════════
@@ -267,6 +287,206 @@ class Agent:
     def get_active_tools(self):
         """Core tools + cualquier tool descubierta por search_tools en este turno."""
         return self.core_tools + self.discovered_tools
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TRADUCCIÓN INCREMENTAL PARA LAYA
+    # ─────────────────────────────────────────────────────────────────────
+    def translate_to_english(self, text):
+        """Traduce un mensaje individual a inglés usando el LLM de forma concisa."""
+        if not text or not isinstance(text, str):
+            return ""
+        text = text.strip()
+        if not text:
+            return ""
+        # Si ya es puramente JSON o estructura de tools, no necesita traducción
+        if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+            return text
+
+        try:
+            resp = self.client.chat.completions.create(
+                model="Bonsai-27b-Q1_0",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Translate the user message directly to concise English. Respond ONLY with the translation, no extra commentary or quotes."
+                    },
+                    {
+                        "role": "user",
+                        "content": text
+                    }
+                ],
+                max_tokens=120,
+                temperature=0.0
+            )
+            res = resp.choices[0].message.content.strip()
+            if res.startswith('"') and res.endswith('"') and len(res) > 1:
+                res = res[1:-1]
+            return res if res else text
+        except Exception as e:
+            print(f"  ⚠️ [TRANSLATE] Error al traducir a inglés para Laya: {e}")
+            return text
+
+    def get_text_en(self, text):
+        """Obtiene y cachea la versión en inglés de un texto."""
+        if not text or not isinstance(text, str):
+            return ""
+        text_clean = text.strip()
+        if text_clean in self._translation_cache:
+            return self._translation_cache[text_clean]
+        en = self.translate_to_english(text_clean)
+        self._translation_cache[text_clean] = en
+        return en
+
+    def get_message_en(self, msg):
+        """Obtiene la versión en inglés de un mensaje (se traduce una sola vez por mensaje)."""
+        if isinstance(msg, dict):
+            if "_content_en" in msg:
+                return msg["_content_en"]
+            content = msg.get("content", "")
+            en = self.get_text_en(content)
+            msg["_content_en"] = en
+            return en
+        else:
+            if hasattr(msg, "_content_en"):
+                return getattr(msg, "_content_en")
+            content = getattr(msg, "content", "")
+            en = self.get_text_en(content)
+            setattr(msg, "_content_en", en)
+            return en
+
+    # ─────────────────────────────────────────────────────────────────────
+    # get_filtered_messages: Filtra el contexto pasado con LAYA (recibe INGLÉS)
+    # ─────────────────────────────────────────────────────────────────────
+    def get_filtered_messages(self, current_task):
+        """
+        Filtra la memoria pasada usando el modelo fine-tuned para decidir qué es útil.
+        A Laya se le envía todo en inglés (traducido y cacheado mensaje por mensaje).
+        Al LLM principal se le entregan los mensajes retenidos en su idioma original.
+        """
+        if len(self.messages) <= 2:
+            return self.messages
+
+        # Encontrar el índice del último mensaje del usuario (inicio del turno actual)
+        last_user_idx = len(self.messages) - 1
+        for i in range(len(self.messages) - 1, -1, -1):
+            msg = self.messages[i]
+            role = msg.get("role") if isinstance(msg, dict) else msg.role
+            if role == "user":
+                last_user_idx = i
+                break
+
+        # Traducir la tarea actual a inglés para Laya (una sola vez)
+        current_task_en = self.get_text_en(current_task)
+        print(f"\n  🧠 [LAYA CONTEXT] Evaluando memoria pasada para: '{current_task}'")
+        print(f"      ↳ Query traducida a Laya (EN): '{current_task_en}'")
+        filtered = [self.messages[0]] # System prompt
+        
+        # Categorías de memoria
+        memory_categories = {
+            "user_preferences": "Identity memory: immutable rules, personal user preferences, language, formatting or style instructions",
+            "project_context": "Working memory: technical details of the user's current task or project (files, configs, errors, decisions)",
+            "general_knowledge": "Semantic memory: concepts, definitions, general facts or reusable code snippets",
+            "conversational_context": "Episodic memory: recent conversational thread, greetings, small talk, acknowledgements"
+        }
+        
+        i = 1
+        while i < last_user_idx:
+            msg = self.messages[i]
+            role = msg.get("role") if isinstance(msg, dict) else msg.role
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+            tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+            
+            block = [msg]
+            content_for_eval = str(content) if content else ""
+            msg_en = self.get_message_en(msg)
+            content_for_eval_en = f"Role: {role}, Content: {msg_en}"
+            
+            if tool_calls:
+                tc_name = tool_calls[0].get("function", {}).get("name") if isinstance(tool_calls[0], dict) else tool_calls[0].function.name
+                content_for_eval += f" [Llamada a tool: {tc_name}]"
+                content_for_eval_en += f" [Tool call: {tc_name}]"
+                
+                # Si el siguiente es un resultado de tool, lo agrupamos
+                if i + 1 < last_user_idx:
+                    next_msg = self.messages[i+1]
+                    next_role = next_msg.get("role") if isinstance(next_msg, dict) else next_msg.role
+                    if next_role == "tool":
+                        block.append(next_msg)
+                        next_content = next_msg.get("content") if isinstance(next_msg, dict) else getattr(next_msg, "content", "")
+                        next_en = self.get_message_en(next_msg)
+                        content_for_eval += f" [Resultado: {str(next_content)[:100]}]"
+                        content_for_eval_en += f" [Result: {str(next_en)[:100]}]"
+                        i += 1
+                        
+            # Si el actual es el usuario y el siguiente es el asistente, los agrupamos para la evaluación
+            if role == "user" and i + 1 < last_user_idx:
+                next_msg = self.messages[i+1]
+                next_role = next_msg.get("role") if isinstance(next_msg, dict) else next_msg.role
+                if next_role == "assistant":
+                    block.append(next_msg)
+                    next_content = next_msg.get("content") if isinstance(next_msg, dict) else getattr(next_msg, "content", "")
+                    asst_en = self.get_message_en(next_msg)
+                    content_for_eval = f"User: {content_for_eval} | Assistant: {str(next_content)}"
+                    content_for_eval_en = f"Role: user, Content: {msg_en}\nRole: assistant, Content: {asst_en}"
+                    i += 1
+                        
+            state = {
+                "current_task": current_task_en,
+                "context_piece": content_for_eval_en
+            }
+            questions = {
+                "is_relevant": {
+                    "type": "noul", 
+                    "instructions": "Is this exchange strictly necessary to solve the current task?"
+                },
+                "should_store": {
+                    "type": "noul", 
+                    "instructions": "Does this exchange contain at least one piece of information worth saving in long-term memory for future conversations?"
+                },
+                "memory_type": {
+                    "type": "choice",
+                    "instructions": "Which type of memory does the most important information in this exchange belong to?",
+                    "criteria": memory_categories
+                }
+            }
+            
+            try:
+                res = self.context_router.predict(state, questions)
+                ans = res.get("answers", {})
+                prob_yes = ans.get("is_relevant", {}).get("noul", 0.0)
+                prob_store = ans.get("should_store", {}).get("noul", 0.0)
+                category = ans.get("memory_type", {}).get("choice")
+                prob_cat = ans.get("memory_type", {}).get("probabilities", {}).get(category, 0.0)
+                
+                display_text = str(content_for_eval).replace("\n", " ")[:60]
+                
+                # RELEVANCIA PARA CONTEXT WINDOW
+                if prob_yes > 0.5:
+                    print(f"    [OK] Retenido (p={prob_yes:.2f}): {display_text}...")
+                    filtered.extend(block)
+                else:
+                    print(f"    [X]  Descartado (p={prob_yes:.2f}): {display_text}...")
+                    
+                # GUARDADO A LARGO PLAZO
+                if prob_store > 0.5 and category in self.memory_store:
+                    # Evitar duplicados exactos
+                    if content_for_eval not in self.memory_store[category]:
+                        self.memory_store[category].append(content_for_eval)
+                        with open("memory_store.json", "w", encoding="utf-8") as f:
+                            json.dump(self.memory_store, f, indent=4, ensure_ascii=False)
+                        print(f"    [SAVE] [LAYA MEMORY] Guardado en {category} (store={prob_store:.2f}, cat={prob_cat:.2f})")
+                        
+            except Exception as e:
+                print(f"    ⚠️ Error evaluando contexto: {e}. Reteniendo por precaución.")
+                filtered.extend(block)
+                
+            i += 1
+            
+        # Añadir todos los mensajes del turno actual
+        filtered.extend(self.messages[last_user_idx:])
+        
+        print(f"  🧠 [LAYA CONTEXT] Retenidos {len(filtered)} de {len(self.messages)} mensajes en total.\n")
+        return filtered
 
     # ─────────────────────────────────────────────────────────────────────
     # search_tools: el LLM busca capacidades extra (LAYA recibe inglés)

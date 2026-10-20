@@ -1,0 +1,23 @@
+# Configuración de CELab Bot (/etc/celab-bot/config.toml)
+
+[llm]
+base_url = "http://localhost:3000/v1"
+model = "Bonsai-27b-Q1_0"
+api_key = "no-key-needed"
+timeout = 90.0
+
+[laya]
+tool_model = "Marianinpb/laya-toolrag-router"
+context_model = "Marianinpb/laya-context-router"
+device = "cpu"  # Cambiar a "cuda" si el servidor tiene GPU Nvidia disponible
+search_threshold = 0.05
+
+[paths]
+shared_dir = "/opt/celab-bot/shared"
+users_file = "/etc/celab-bot/users.toml"
+
+[server]
+host = "0.0.0.0"
+port = 8000
+api_key = "celab-secret-key"  # Colocar la misma clave en la configuración de modelo de OpenWebUI
+require_confirmation = true   # Solicitar confirmación antes de ejecutar comandos terminales

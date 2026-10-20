@@ -1,3 +1,12 @@
 __pycache__/
 venv/
 .env
+*.log
+memory_store.json
+*.egg-info/
+build/
+dist/
+users.toml
+laya_memory_router/
+*.safetensors
+*.zip

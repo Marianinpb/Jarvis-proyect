@@ -1,0 +1,3 @@
+# Regla sudoers acotada para celab-bot
+# Permite al usuario de servicio ejecutar celab-exec exclusivamente como usuarios del grupo celab-users
+celab-bot ALL=(%celab-users) NOPASSWD: /opt/celab-bot/bin/celab-exec
