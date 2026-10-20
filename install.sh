@@ -40,11 +40,18 @@ elif command -v pacman &> /dev/null; then
     pacman -Sy --noconfirm git curl python python-pip
 fi
 
-# Instalar uv si no existe
-if ! command -v uv &> /dev/null; then
+# Detectar o instalar uv
+UV_BIN=$(command -v uv || true)
+[ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ] && UV_BIN="$HOME/.local/bin/uv"
+[ -z "$UV_BIN" ] && [ -x "/root/.local/bin/uv" ] && UV_BIN="/root/.local/bin/uv"
+
+if [ -z "$UV_BIN" ]; then
     echo -e "${YELLOW}Instalando gestor uv para instalación rápida de Python...${NC}"
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH:/root/.local/bin"
+    UV_BIN=$(command -v uv || true)
+    [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ] && UV_BIN="$HOME/.local/bin/uv"
+    [ -z "$UV_BIN" ] && [ -x "/root/.local/bin/uv" ] && UV_BIN="/root/.local/bin/uv"
 fi
 
 # 3. Crear grupos y usuarios de sistema
@@ -73,14 +80,15 @@ fi
 # 4. Clonar o actualizar repositorio en /opt/celab-bot
 echo -e "\n${BLUE}[3/7] Descargando código en ${INSTALL_DIR}...${NC}"
 if [ -d "$INSTALL_DIR/.git" ]; then
-    echo -e "${YELLOW}El directorio ya existe. Actualizando con git pull...${NC}"
-    git -C "$INSTALL_DIR" pull --ff-only
+    echo -e "${YELLOW}El directorio ya existe. Sincronizando con git fetch & reset...${NC}"
+    git -C "$INSTALL_DIR" fetch origin
+    git -C "$INSTALL_DIR" reset --hard origin/master 2>/dev/null || git -C "$INSTALL_DIR" reset --hard origin/main
 else
     mkdir -p "$INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-# 5. Configurar directorios y permisos
+# 5. Configurar directorios y permisos iniciales
 echo -e "\n${BLUE}[4/7] Configurando directorios y permisos de ejecución...${NC}"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$INSTALL_DIR/shared/tools"
@@ -97,29 +105,35 @@ if [ ! -f "$CONFIG_DIR/users.toml" ]; then
     echo -e "${GREEN}✓ Creado ${CONFIG_DIR}/users.toml vacío.${NC}"
 fi
 
-# Ajustar permisos de directorios
-chown -R celab-bot:celab-users "$INSTALL_DIR"
-chmod -R 775 "$INSTALL_DIR/shared"
-chmod +x "$INSTALL_DIR/bin/celab-bot"
-chmod +x "$INSTALL_DIR/bin/celab-exec"
-
 # Enlaces simbólicos globales en /usr/local/bin
 ln -sf "$INSTALL_DIR/bin/celab-bot" /usr/local/bin/celab-bot
 ln -sf "$INSTALL_DIR/bin/celab-exec" /usr/local/bin/celab-exec
 
 # 6. Crear entorno virtual e instalar dependencias
 echo -e "\n${BLUE}[5/7] Creando entorno virtual de Python e instalando paquetes...${NC}"
-if command -v uv &> /dev/null; then
-    uv venv "$INSTALL_DIR/venv"
-    "$INSTALL_DIR/venv/bin/python" -m pip install --upgrade pip
-    "$INSTALL_DIR/venv/bin/pip" install -e "$INSTALL_DIR"
-    "$INSTALL_DIR/venv/bin/pip" install laya torch transformers safetensors
+if [ -n "$UV_BIN" ] && [ -x "$UV_BIN" ]; then
+    echo -e "${GREEN}Usando uv ($UV_BIN)...${NC}"
+    "$UV_BIN" venv "$INSTALL_DIR/venv"
+    "$UV_BIN" pip install --python "$INSTALL_DIR/venv" -e "$INSTALL_DIR"
+    "$UV_BIN" pip install --python "$INSTALL_DIR/venv" laya torch transformers safetensors
 else
     python3 -m venv "$INSTALL_DIR/venv"
+    if [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py | "$INSTALL_DIR/venv/bin/python"
+    fi
     "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
     "$INSTALL_DIR/venv/bin/pip" install -e "$INSTALL_DIR"
     "$INSTALL_DIR/venv/bin/pip" install laya torch transformers safetensors
 fi
+
+# Ajustar permisos finales tras crear el venv
+chown -R celab-bot:celab-users "$INSTALL_DIR"
+chown -R celab-bot:celab-users "$CONFIG_DIR"
+chmod -R 775 "$INSTALL_DIR/shared"
+chmod -R 775 "$CONFIG_DIR"
+chmod +x "$INSTALL_DIR/bin/celab-bot"
+chmod +x "$INSTALL_DIR/bin/celab-exec"
+
 
 # 7. Configurar sudoers y systemd
 echo -e "\n${BLUE}[6/7] Configurando seguridad sudoers y systemd...${NC}"
