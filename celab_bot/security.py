@@ -28,11 +28,16 @@ def requires_user_confirmation(tool_name: str, args: Dict[str, Any]) -> Tuple[bo
     return False, ""
 
 
-def format_confirmation_request(tool_call_id: str, tool_name: str, description: str) -> str:
+def format_confirmation_request(tool_call_id: str, tool_name: str, description: str, quest: str = "") -> str:
     """Formatea la petición de confirmación para ser renderizada en OpenWebUI."""
+    quest_section = f"\n🎯 **Objetivo:** *{quest}*\n" if quest else ""
     return (
         f"⚠️ **Confirmación de Seguridad Requerida**\n\n"
-        f"CELab bot solicita autorización para:\n"
-        f"> **{description}**\n\n"
-        f"¿Deseas autorizar esta acción? (Responde *'sí'* para confirmar o *'no'* para cancelar)."
+        f"CELab bot solicita tu autorización para:\n"
+        f"> **{description}**\n"
+        f"{quest_section}\n"
+        f"¿Deseas autorizar esta acción?\n"
+        f"- Responde **\"sí\"** (o *adelante / confirmar*) para ejecutarla inmediatamente.\n"
+        f"- Responde **\"no\"** (o *cancelar*) para descartarla y buscar una alternativa."
     )
+

@@ -16,13 +16,39 @@ from celab_bot.memory import UserMemoryStore
 from celab_bot.security import requires_user_confirmation, format_confirmation_request
 from celab_bot.users import get_linux_user, is_admin_user
 
-try:
-    from laya import Router
-except ImportError:
-    Router = None
+# Mapeo en memoria de confirmaciones pendientes de usuario: { linux_user: dict }
+PENDING_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+
+AFFIRMATIVE_WORDS = {
+    "si", "sí", "yes", "y", "s", "adelante", "procede", "proceder",
+    "dale", "ok", "afirmativo", "confirmo", "confirmar", "hazlo",
+    "ejecutar", "ejecútalo", "ejecutalo", "autorizo", "autorizado",
+    "claro", "por supuesto", "de acuerdo", "va"
+}
+
+NEGATIVE_WORDS = {
+    "no", "nop", "n", "cancelar", "cancela", "detener", "detén",
+    "deten", "rechazar", "rechazo", "abortar", "abort", "para", "alto",
+    "negativo", "denegar"
+}
+
+
+def check_confirmation_intent(text: str) -> Optional[bool]:
+    """Retorna True si la respuesta es afirmativa, False si es negativa, o None si no corresponde."""
+    clean = text.strip().lower()
+    if not clean:
+        return None
+    tokens = clean.split()
+    first_word = tokens[0].rstrip(".,!?:;")
+    if clean in AFFIRMATIVE_WORDS or first_word in AFFIRMATIVE_WORDS:
+        return True
+    if clean in NEGATIVE_WORDS or first_word in NEGATIVE_WORDS:
+        return False
+    return None
 
 
 def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
+
     config = config or load_config()
 
     app = FastAPI(
@@ -188,6 +214,47 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                 current_query = m.get("content", "")
                 break
 
+        # Gestión del ciclo de confirmación en el harness
+        pending = PENDING_CONFIRMATIONS.get(linux_user)
+        action_executed_info = None
+        action_denied_info = None
+
+        if pending:
+            # Expirar confirmaciones pendientes tras 15 minutos (900 seg)
+            if time.time() - pending.get("timestamp", 0) > 900:
+                PENDING_CONFIRMATIONS.pop(linux_user, None)
+                pending = None
+
+        if pending:
+            intent = check_confirmation_intent(current_query)
+            if intent is True:
+                # El usuario AUTORIZÓ la acción: el harness la ejecuta de inmediato
+                PENDING_CONFIRMATIONS.pop(linux_user, None)
+                tool_res = engine.execute_tool(
+                    pending["tool_name"],
+                    pending["args"],
+                    linux_user,
+                    is_admin,
+                )
+                action_executed_info = {
+                    "tool_name": pending["tool_name"],
+                    "args": pending["args"],
+                    "description": pending["description"],
+                    "quest": pending["quest"],
+                    "result": tool_res,
+                }
+            elif intent is False:
+                # El usuario DENEGÓ la acción
+                PENDING_CONFIRMATIONS.pop(linux_user, None)
+                action_denied_info = {
+                    "tool_name": pending["tool_name"],
+                    "description": pending["description"],
+                    "quest": pending["quest"],
+                }
+            else:
+                # Mensaje no relacionado con la confirmación: descartar acción pendiente previa
+                PENDING_CONFIRMATIONS.pop(linux_user, None)
+
         # Iniciar System Prompt personalizado para CELab bot
         system_content = (
             f"Eres CELab bot, el asistente inteligente del laboratorio. "
@@ -205,14 +272,62 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         else:
             prepared_messages[0]["content"] = system_content
 
-        # Filtrar contexto con Laya
-        filtered_msgs = engine.get_filtered_messages(prepared_messages, current_query, memory_store)
+        # Inyectar contexto al modelo según la decisión del usuario
+        if action_executed_info:
+            prepared_messages.append({
+                "role": "system",
+                "content": (
+                    f"[ACCIÓN AUTORIZADA Y EJECUTADA DIRECTAMENTE POR EL HARNESS]:\n"
+                    f"El usuario autorizó la acción '{action_executed_info['tool_name']}' ({action_executed_info['description']}) "
+                    f"para la tarea original: '{action_executed_info['quest']}'.\n"
+                    f"Resultado de la ejecución:\n{json.dumps(action_executed_info['result'], ensure_ascii=False)}\n\n"
+                    f"INSTRUCCIÓN: La acción ya se ejecutó con éxito. NO vuelvas a solicitar confirmación ni a llamar a esta misma herramienta. "
+                    f"Informa al usuario sobre el resultado obtenido y continúa con los pasos pendientes de la tarea si los hay."
+                )
+            })
+        elif action_denied_info:
+            prepared_messages.append({
+                "role": "system",
+                "content": (
+                    f"[PERMISO DENEGADO POR EL USUARIO]:\n"
+                    f"El usuario DENEGÓ el permiso para ejecutar '{action_denied_info['tool_name']}' ({action_denied_info['description']}).\n"
+                    f"La tarea original que intentabas resolver era: '{action_denied_info['quest']}'.\n\n"
+                    f"INSTRUCCIÓN: Con esta negativa, NO intentes ejecutar esta misma acción otra vez. "
+                    f"Evalúa si puedes resolver la tarea con una alternativa viable que no requiera esa acción destructiva, "
+                    f"o explica al usuario con amabilidad qué se requería y pregúntale cómo desea proceder."
+                )
+            })
+
+        # Filtrar contexto con Laya (si hubo autorización/denegación, mantener prepared_messages intacto)
+        if action_executed_info or action_denied_info:
+            filtered_msgs = prepared_messages
+        else:
+            filtered_msgs = engine.get_filtered_messages(prepared_messages, current_query, memory_store)
 
         # Iniciar ciclo de respuesta agéntica con streaming
         async def response_generator() -> AsyncGenerator[str, None]:
             discovered_tools = []
             active_tools = engine.tools_registry.get_core_tools()
             conversation_history = list(filtered_msgs)
+
+            # Si acabamos de ejecutar una acción autorizada, mostrar su bloque colapsable de inmediato
+            if action_executed_info:
+                t_name = action_executed_info["tool_name"]
+                t_desc = action_executed_info["description"]
+                t_res = action_executed_info["result"]
+                res_str = json.dumps(t_res, ensure_ascii=False, indent=2)
+                preview = (res_str[:300] + "...") if len(res_str) > 300 else res_str
+                yield sse_chunk(
+                    f"\n<details open><summary>✅ <b>Acción autorizada por el usuario:</b> <code>{t_name}</code></summary>\n\n"
+                    f"**Operación ejecutada:** `{t_desc}`\n\n"
+                    f"```json\n{preview}\n```\n"
+                    f"</details>\n\n"
+                )
+            elif action_denied_info:
+                t_desc = action_denied_info["description"]
+                yield sse_chunk(
+                    f"\n> 🚫 **Acción cancelada:** No se ejecutó `{t_desc}`.\n\n"
+                )
 
             while True:
                 # 1. Llamar al LLM
@@ -271,9 +386,16 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                         # Verificar confirmación para herramientas destructivas
                         req_confirm, desc = requires_user_confirmation(fn_name, args)
                         if req_confirm and config.require_confirmation:
-                            # Notificar en chat
-                            confirm_text = format_confirmation_request(tc.id, fn_name, desc)
-                            yield sse_chunk(f"{confirm_text}\n</details>\n\n")
+                            PENDING_CONFIRMATIONS[linux_user] = {
+                                "tool_name": fn_name,
+                                "args": args,
+                                "description": desc,
+                                "quest": current_query,
+                                "timestamp": time.time(),
+                            }
+                            confirm_text = format_confirmation_request(tc.id, fn_name, desc, current_query)
+                            # Cerrar el bloque de detalles para que la solicitud quede visible afuera
+                            yield sse_chunk(f"⏳ <i>Esperando autorización del usuario...</i>\n</details>\n\n{confirm_text}\n\n")
                             yield sse_chunk("", finish_reason="stop")
                             yield "data: [DONE]\n\n"
                             return
@@ -291,6 +413,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                         "tool_call_id": tc.id,
                         "content": json.dumps(tool_res, ensure_ascii=False)
                     })
+
 
         if stream:
             return StreamingResponse(response_generator(), media_type="text/event-stream")
