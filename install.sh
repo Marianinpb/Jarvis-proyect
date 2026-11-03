@@ -79,7 +79,21 @@ fi
 
 # 4. Clonar o actualizar repositorio en /opt/celab-bot
 echo -e "\n${BLUE}[3/7] Descargando código en ${INSTALL_DIR}...${NC}"
+
+# Si /mnt/HDD existe, instalamos físicamente en /mnt/HDD/celab-bot y creamos symlink en /opt/celab-bot
+if [ -d "/mnt/HDD" ]; then
+    REAL_TARGET_DIR="/mnt/HDD/celab-bot"
+    echo -e "${GREEN}✓ Detectado disco de almacenamiento masivo en /mnt/HDD${NC}"
+    echo -e "${GREEN}✓ La instalación residirá físicamente en: ${REAL_TARGET_DIR}${NC}"
+    mkdir -p "$REAL_TARGET_DIR"
+    if [ ! -L "$INSTALL_DIR" ]; then
+        rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        ln -sfn "$REAL_TARGET_DIR" "$INSTALL_DIR"
+    fi
+fi
+
 git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+git config --global --add safe.directory "/mnt/HDD/celab-bot" 2>/dev/null || true
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo -e "${YELLOW}El directorio ya existe. Sincronizando con git fetch & reset...${NC}"
     git -C "$INSTALL_DIR" fetch origin

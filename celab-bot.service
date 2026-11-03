@@ -17,7 +17,7 @@ Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
 NoNewPrivileges=no
 ProtectSystem=full
 ProtectHome=no
-ReadWritePaths=/opt/celab-bot /etc/celab-bot /tmp
+ReadWritePaths=/opt/celab-bot /mnt/HDD/celab-bot /etc/celab-bot /tmp
 
 [Install]
 WantedBy=multi-user.target
