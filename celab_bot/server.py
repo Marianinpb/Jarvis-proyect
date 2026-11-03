@@ -345,31 +345,35 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         else:
             prepared_messages[0]["content"] = system_content
 
-        # Inyectar contexto al modelo según la decisión del usuario
+        # Inyectar contexto al modelo según la decisión del usuario (en el último mensaje de usuario para respetar plantillas Jinja que exigen system solo al inicio)
         if action_executed_info:
-            prepared_messages.append({
-                "role": "system",
-                "content": (
-                    f"[ACCIÓN AUTORIZADA Y EJECUTADA DIRECTAMENTE POR EL HARNESS]:\n"
-                    f"El usuario autorizó la acción '{action_executed_info['tool_name']}' ({action_executed_info['description']}) "
-                    f"para la tarea original: '{action_executed_info['quest']}'.\n"
-                    f"Resultado de la ejecución:\n{json.dumps(action_executed_info['result'], ensure_ascii=False)}\n\n"
-                    f"INSTRUCCIÓN: La acción YA FUE EJECUTADA CON ÉXITO. No llames a search_tools ni vuelvas a ejecutar el comando. "
-                    f"Simplemente confirma al usuario en español que la acción se completó y muéstrale el resultado."
-                )
-            })
+            exec_note = (
+                f"\n\n[ACCIÓN AUTORIZADA Y EJECUTADA DIRECTAMENTE POR EL HARNESS]:\n"
+                f"El usuario autorizó la acción '{action_executed_info['tool_name']}' ({action_executed_info['description']}) "
+                f"para la tarea original: '{action_executed_info['quest']}'.\n"
+                f"Resultado de la ejecución:\n{json.dumps(action_executed_info['result'], ensure_ascii=False)}\n\n"
+                f"INSTRUCCIÓN: La acción YA FUE EJECUTADA CON ÉXITO. No llames a search_tools ni vuelvas a ejecutar el comando. "
+                f"Simplemente confirma al usuario en español que la acción se completó y muéstrale el resultado."
+            )
+            if prepared_messages and prepared_messages[-1].get("role") == "user":
+                prepared_messages[-1] = dict(prepared_messages[-1])
+                prepared_messages[-1]["content"] = f"{prepared_messages[-1].get('content', '')}{exec_note}"
+            else:
+                prepared_messages.append({"role": "user", "content": exec_note})
         elif action_denied_info:
-            prepared_messages.append({
-                "role": "system",
-                "content": (
-                    f"[PERMISO DENEGADO POR EL USUARIO]:\n"
-                    f"El usuario DENEGÓ el permiso para ejecutar '{action_denied_info['tool_name']}' ({action_denied_info['description']}).\n"
-                    f"La tarea original que intentabas resolver era: '{action_denied_info['quest']}'.\n\n"
-                    f"INSTRUCCIÓN: Con esta negativa, NO intentes ejecutar esta misma acción otra vez. "
-                    f"Evalúa si puedes resolver la tarea con una alternativa viable que no requiera esa acción destructiva, "
-                    f"o explica al usuario con amabilidad qué se requería y pregúntale cómo desea proceder."
-                )
-            })
+            denied_note = (
+                f"\n\n[PERMISO DENEGADO POR EL USUARIO]:\n"
+                f"El usuario DENEGÓ el permiso para ejecutar '{action_denied_info['tool_name']}' ({action_denied_info['description']}).\n"
+                f"La tarea original que intentabas resolver era: '{action_denied_info['quest']}'.\n\n"
+                f"INSTRUCCIÓN: Con esta negativa, NO intentes ejecutar esta misma acción otra vez. "
+                f"Evalúa si puedes resolver la tarea con una alternativa viable que no requiera esa acción destructiva, "
+                f"o explica al usuario con amabilidad qué se requería y pregúntale cómo desea proceder."
+            )
+            if prepared_messages and prepared_messages[-1].get("role") == "user":
+                prepared_messages[-1] = dict(prepared_messages[-1])
+                prepared_messages[-1]["content"] = f"{prepared_messages[-1].get('content', '')}{denied_note}"
+            else:
+                prepared_messages.append({"role": "user", "content": denied_note})
 
         # Filtrar contexto con Laya (si hubo autorización/denegación, mantener prepared_messages intacto)
         if action_executed_info or action_denied_info:
@@ -393,14 +397,14 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                 preview = (res_str[:300] + "...") if len(res_str) > 300 else res_str
                 yield sse_chunk(
                     f"\n<details open><summary>✅ <b>Acción autorizada y ejecutada:</b> <code>{t_name}</code></summary>\n\n"
-                    f"**Operación:** `{t_desc}`\n\n"
+                    f"**Operación:** {t_desc}\n\n"
                     f"```json\n{preview}\n```\n"
                     f"</details>\n\n"
                 )
             elif action_denied_info:
                 t_desc = action_denied_info["description"]
                 yield sse_chunk(
-                    f"\n> 🚫 **Acción cancelada:** No se ejecutó `{t_desc}`.\n\n"
+                    f"\n> 🚫 **Acción cancelada:** No se ejecutó {t_desc}.\n\n"
                 )
 
             while True:
