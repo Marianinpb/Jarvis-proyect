@@ -16,6 +16,11 @@ from celab_bot.memory import UserMemoryStore
 from celab_bot.security import requires_user_confirmation, format_confirmation_request
 from celab_bot.users import get_linux_user, is_admin_user
 
+try:
+    from laya import Router
+except ImportError:
+    Router = None
+
 # Mapeo en memoria de confirmaciones pendientes de usuario: { linux_user: dict }
 PENDING_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
 
