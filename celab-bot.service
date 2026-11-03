@@ -12,6 +12,7 @@ Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=HF_HOME=/mnt/HDD/celab-bot/.cache/huggingface
 
 # Seguridad del servicio
 NoNewPrivileges=no
