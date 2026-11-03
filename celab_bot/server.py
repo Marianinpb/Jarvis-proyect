@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -36,6 +37,32 @@ NEGATIVE_WORDS = {
     "deten", "rechazar", "rechazo", "abortar", "abort", "para", "alto",
     "negativo", "denegar"
 }
+
+INTERNAL_TASK_MARKERS = (
+    "### Task:",
+    "Generate a concise",
+    "Suggest 3-5 relevant follow-up",
+    "Generate 1-3 broad tags",
+    "### Chat History:",
+)
+
+
+def is_openwebui_background_task(text: str) -> bool:
+    """Detecta si la petición es una tarea automática en segundo plano de OpenWebUI (títulos, tags, sugerencias)."""
+    if not text or not isinstance(text, str):
+        return False
+    return any(marker in text for marker in INTERNAL_TASK_MARKERS)
+
+
+def strip_ui_blocks(text: str) -> str:
+    """Limpia bloques <details> y alertas de seguridad del historial antes de enviarlo al LLM."""
+    if not text or not isinstance(text, str):
+        return ""
+    # Remover bloques <details>...</details>
+    cleaned = re.sub(r"<details[\s\S]*?</details>", "", text)
+    # Remover cartel de confirmación de seguridad si quedó en el historial
+    cleaned = re.sub(r"⚠️ \*\*Confirmación de Seguridad Requerida\*\*[\s\S]*?buscar una alternativa\.", "", cleaned)
+    return cleaned.strip()
 
 
 def check_confirmation_intent(text: str) -> Optional[bool]:
@@ -171,10 +198,49 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         messages = body.get("messages", [])
         stream = body.get("stream", False)
 
+        # Extraer última consulta del usuario
+        current_query = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                current_query = m.get("content", "")
+                break
+
+        # 0. Si es una petición automática en segundo plano de OpenWebUI (generar título, tags, sugerencias):
+        # Responder directamente con el LLM sin tocar PENDING_CONFIRMATIONS ni invocar herramientas.
+        if is_openwebui_background_task(current_query):
+            try:
+                bg_resp = llm_client.chat.completions.create(
+                    model=config.llm_model,
+                    messages=messages,
+                )
+                bg_text = bg_resp.choices[0].message.content or ""
+            except Exception:
+                bg_text = "Chat"
+
+            if stream:
+                async def bg_stream():
+                    yield sse_chunk(bg_text)
+                    yield sse_chunk("", finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(bg_stream(), media_type="text/event-stream")
+            else:
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": "celab-bot",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": bg_text},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+
         # Detectar identidad de OpenWebUI
         user_identity = x_openwebui_user_name or x_openwebui_user_email or x_openwebui_user_id
         if not user_identity and messages:
-            # Fallback en caso de prueba local o sin headers
             user_identity = "default_user"
 
         linux_user = get_linux_user(user_identity, config.users_file)
@@ -211,13 +277,6 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
         is_admin = is_admin_user(linux_user)
         memory_store = UserMemoryStore(linux_user)
-
-        # Extraer última consulta del usuario
-        current_query = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                current_query = m.get("content", "")
-                break
 
         # Gestión del ciclo de confirmación en el harness
         pending = PENDING_CONFIRMATIONS.get(linux_user)
@@ -257,7 +316,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     "quest": pending["quest"],
                 }
             else:
-                # Mensaje no relacionado con la confirmación: descartar acción pendiente previa
+                # Mensaje nuevo no relacionado con la confirmación: descartar acción pendiente previa
                 PENDING_CONFIRMATIONS.pop(linux_user, None)
 
         # Iniciar System Prompt personalizado para CELab bot
@@ -270,8 +329,17 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
             f"Para conversaciones generales, saludos, dudas de física o preguntas personales, responde directamente."
         )
 
+        # Limpiar bloques de interfaz (<details> y carteles de confirmación) de los mensajes previos del asistente
+        cleaned_messages = []
+        for m in messages:
+            m_copy = dict(m)
+            if m_copy.get("role") == "assistant" and isinstance(m_copy.get("content"), str):
+                c_clean = strip_ui_blocks(m_copy["content"])
+                m_copy["content"] = c_clean if c_clean else "(Esperando respuesta del usuario)"
+            cleaned_messages.append(m_copy)
+
         # Asegurar mensaje de sistema al inicio
-        prepared_messages = list(messages)
+        prepared_messages = list(cleaned_messages)
         if not prepared_messages or prepared_messages[0].get("role") != "system":
             prepared_messages.insert(0, {"role": "system", "content": system_content})
         else:
@@ -286,8 +354,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     f"El usuario autorizó la acción '{action_executed_info['tool_name']}' ({action_executed_info['description']}) "
                     f"para la tarea original: '{action_executed_info['quest']}'.\n"
                     f"Resultado de la ejecución:\n{json.dumps(action_executed_info['result'], ensure_ascii=False)}\n\n"
-                    f"INSTRUCCIÓN: La acción ya se ejecutó con éxito. NO vuelvas a solicitar confirmación ni a llamar a esta misma herramienta. "
-                    f"Informa al usuario sobre el resultado obtenido y continúa con los pasos pendientes de la tarea si los hay."
+                    f"INSTRUCCIÓN: La acción YA FUE EJECUTADA CON ÉXITO. No llames a search_tools ni vuelvas a ejecutar el comando. "
+                    f"Simplemente confirma al usuario en español que la acción se completó y muéstrale el resultado."
                 )
             })
         elif action_denied_info:
@@ -312,7 +380,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         # Iniciar ciclo de respuesta agéntica con streaming
         async def response_generator() -> AsyncGenerator[str, None]:
             discovered_tools = []
-            active_tools = engine.tools_registry.get_core_tools()
+            # Si ya acabamos de ejecutar la acción autorizada, no le pasamos tools en el primer paso para evitar que las re-invoque
+            active_tools = None if action_executed_info else engine.tools_registry.get_core_tools()
             conversation_history = list(filtered_msgs)
 
             # Si acabamos de ejecutar una acción autorizada, mostrar su bloque colapsable de inmediato
@@ -323,8 +392,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                 res_str = json.dumps(t_res, ensure_ascii=False, indent=2)
                 preview = (res_str[:300] + "...") if len(res_str) > 300 else res_str
                 yield sse_chunk(
-                    f"\n<details open><summary>✅ <b>Acción autorizada por el usuario:</b> <code>{t_name}</code></summary>\n\n"
-                    f"**Operación ejecutada:** `{t_desc}`\n\n"
+                    f"\n<details open><summary>✅ <b>Acción autorizada y ejecutada:</b> <code>{t_name}</code></summary>\n\n"
+                    f"**Operación:** `{t_desc}`\n\n"
                     f"```json\n{preview}\n```\n"
                     f"</details>\n\n"
                 )
@@ -419,12 +488,9 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                         "content": json.dumps(tool_res, ensure_ascii=False)
                     })
 
-
         if stream:
             return StreamingResponse(response_generator(), media_type="text/event-stream")
         else:
-            # Versión no-streaming consolidada
-            # Consumir generador
             full_content = ""
             async for chunk in response_generator():
                 if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
