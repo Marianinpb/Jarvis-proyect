@@ -306,7 +306,7 @@ class AgentEngine:
                     text=True,
                     capture_output=True,
                     timeout=30.0,
-                    cwd=str(get_user_home(linux_user))
+                    cwd="/tmp"
                 )
                 if res.returncode != 0:
                     return {"error": f"Error ejecutando como {linux_user}: {res.stderr}"}
