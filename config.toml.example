@@ -5,12 +5,20 @@ base_url = "http://localhost:3000/v1"
 model = "Bonsai-27b-Q1_0"
 api_key = "no-key-needed"
 timeout = 90.0
+max_tokens = 1024
+temperature = 0.2
+repeat_penalty = 1.1
 
 [laya]
 tool_model = "Marianinpb/laya-toolrag-router"
 context_model = "Marianinpb/laya-context-router"
 device = "cpu"  # Cambiar a "cuda" si el servidor tiene GPU Nvidia disponible
 search_threshold = 0.05
+
+[agent]
+max_agent_steps = 8
+max_memory_inject = 5
+always_include_terminal_tool = true
 
 [paths]
 shared_dir = "/opt/celab-bot/shared"

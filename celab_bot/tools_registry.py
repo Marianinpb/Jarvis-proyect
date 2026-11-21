@@ -24,14 +24,34 @@ class ToolsRegistry:
         except Exception:
             pass
 
-    def get_core_tools(self) -> List[Dict[str, Any]]:
-        """Herramienta básica inicial para el LLM."""
-        return [
+    def get_terminal_tool(self) -> Dict[str, Any]:
+        """Devuelve el esquema de la herramienta de terminal."""
+        return {
+            "type": "function",
+            "function": {
+                "name": "run_terminal_command",
+                "description": "Executes a bash/shell command in the user's Linux terminal. Use when no specialized tool applies or when running shell utilities, scripts, git, python, or system checks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The exact shell command to execute in the terminal."
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }
+
+    def get_core_tools(self, include_terminal: bool = True) -> List[Dict[str, Any]]:
+        """Herramientas básicas siempre disponibles para el LLM."""
+        tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "search_tools",
-                    "description": "Searches the agent's memory for tools and recipes. Write the query IN ENGLISH. Example: 'list files in directory'. Returns matching tools you can use in your next response.",
+                    "description": "Searches the agent's memory for specialized tools and recipes (reading/editing files, listing directories, web search, creating tools/recipes). Write the query IN ENGLISH. Example: 'list files in directory'.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -45,10 +65,14 @@ class ToolsRegistry:
                 }
             }
         ]
+        if include_terminal:
+            tools.append(self.get_terminal_tool())
+        return tools
 
-    def get_builtin_tools(self) -> List[Dict[str, Any]]:
-        """Herramientas del sistema siempre disponibles mediante search_tools."""
-        return [
+    def get_builtin_tools(self, exclude_names: Optional[set] = None) -> List[Dict[str, Any]]:
+        """Herramientas del sistema descubribles mediante search_tools."""
+        excluded = exclude_names or set()
+        all_builtins = [
             {
                 "type": "function",
                 "function": {
@@ -222,6 +246,7 @@ class ToolsRegistry:
                 }
             }
         ]
+        return [t for t in all_builtins if t["function"]["name"] not in excluded]
 
     def get_user_dirs(self, linux_user: str) -> Tuple[Path, Path]:
         """Devuelve (user_tools_dir, user_recipes_dir) en users_data del usuario."""

@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -19,12 +19,20 @@ class CelabConfig:
     llm_model: str = "Bonsai-27b-Q1_0"
     llm_api_key: str = "no-key-needed"
     llm_timeout: float = 90.0
+    llm_max_tokens: int = 1024
+    llm_temperature: float = 0.2
+    llm_repeat_penalty: float = 1.1
 
     # Laya Routers
     tool_model_path: str = "Marianinpb/laya-toolrag-router"
     context_model_path: str = "Marianinpb/laya-context-router"
     laya_device: str = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
     search_threshold: float = 0.05
+
+    # Agent & Memory Settings
+    max_agent_steps: int = 8
+    max_memory_inject: int = 5
+    always_include_terminal_tool: bool = True
 
     # System Paths
     shared_dir: Path = Path("/opt/celab-bot/shared")
@@ -63,19 +71,29 @@ def load_config(config_path: Optional[str] = None) -> CelabConfig:
         try:
             with open(selected_file, "rb") as f:
                 data = tomllib.load(f)
-            
+
             # Mapear secciones del TOML
             llm = data.get("llm", {})
             cfg.llm_base_url = llm.get("base_url", cfg.llm_base_url)
             cfg.llm_model = llm.get("model", cfg.llm_model)
             cfg.llm_api_key = llm.get("api_key", cfg.llm_api_key)
             cfg.llm_timeout = float(llm.get("timeout", cfg.llm_timeout))
+            cfg.llm_max_tokens = int(llm.get("max_tokens", cfg.llm_max_tokens))
+            cfg.llm_temperature = float(llm.get("temperature", cfg.llm_temperature))
+            cfg.llm_repeat_penalty = float(llm.get("repeat_penalty", cfg.llm_repeat_penalty))
 
             laya = data.get("laya", {})
             cfg.tool_model_path = laya.get("tool_model", cfg.tool_model_path)
             cfg.context_model_path = laya.get("context_model", cfg.context_model_path)
             cfg.laya_device = laya.get("device", cfg.laya_device)
             cfg.search_threshold = float(laya.get("search_threshold", cfg.search_threshold))
+
+            agent = data.get("agent", {})
+            cfg.max_agent_steps = int(agent.get("max_agent_steps", cfg.max_agent_steps))
+            cfg.max_memory_inject = int(agent.get("max_memory_inject", cfg.max_memory_inject))
+            cfg.always_include_terminal_tool = bool(
+                agent.get("always_include_terminal_tool", cfg.always_include_terminal_tool)
+            )
 
             paths = data.get("paths", {})
             if "shared_dir" in paths:

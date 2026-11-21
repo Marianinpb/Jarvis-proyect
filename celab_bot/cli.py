@@ -4,11 +4,13 @@ Módulo CLI de administración y servicio para celab-bot.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from celab_bot.config import load_config
+from celab_bot.memory import UserMemoryStore
 from celab_bot.users import is_admin_user, link_user, load_users, unlink_user
 
 
@@ -47,6 +49,34 @@ def cmd_users(args):
         role = "ADMIN" if is_admin_user(lx) else "user"
         print(f"{ow:<30} {lx:<15} {role:<10}")
     print("-" * 55)
+
+
+def cmd_memory(args):
+    store = UserMemoryStore(args.linux_user)
+    stats = store.get_stats()
+    print(f"🧠 Base de Datos de Memoria SQLite — Usuario: {args.linux_user}")
+    print(f"   Ruta DB: {stats['db_path']} (FTS5: {'ON' if stats['fts_enabled'] else 'OFF'})")
+    print(f"   Mensajes clasificados: {stats['total_messages']} | Traducciones cacheadas: {stats['total_translations']}")
+    print("   Recuerdos activos por categoría:")
+    for cat, count in stats["memories_by_category"].items():
+        print(f"     • {cat}: {count}")
+
+    if args.show_all:
+        all_mems = store.get_all()
+        print("\n📚 Recuerdos guardados:")
+        for cat, items in all_mems.items():
+            if items:
+                print(f"\n  [{cat}]")
+                for idx, item in enumerate(items, 1):
+                    print(f"    {idx}. {item[:180]}")
+
+    if args.recent:
+        recent = store.get_recent_messages(limit=args.recent)
+        print(f"\n🕒 Últimos {len(recent)} mensajes clasificados por Laya:")
+        for m in recent:
+            rel = f"{m['is_relevant_score']:.2f}" if m["is_relevant_score"] is not None else "-"
+            st = f"{m['should_store_score']:.2f}" if m["should_store_score"] is not None else "-"
+            print(f"  #{m['id']} [{m['category'] or 'n/a'} | rel={rel} store={st}] {m['content'][:120]}")
 
 
 def cmd_status(args):
@@ -92,7 +122,6 @@ def cmd_update(args):
     print("✅ Actualización completada con éxito.")
 
 
-
 def cmd_serve(args):
     import uvicorn
     from celab_bot.server import create_app
@@ -120,6 +149,13 @@ def main():
     # Users
     p_users = subparsers.add_parser("users", help="Listar usuarios vinculados")
     p_users.set_defaults(func=cmd_users)
+
+    # Memory DB Inspector
+    p_mem = subparsers.add_parser("memory", help="Inspeccionar base de datos SQLite de memoria de un usuario")
+    p_mem.add_argument("linux_user", help="Usuario Linux cuya memoria SQLite deseas inspeccionar")
+    p_mem.add_argument("--all", dest="show_all", action="store_true", help="Mostrar todos los recuerdos guardados")
+    p_mem.add_argument("--recent", type=int, default=0, help="Mostrar los últimos N mensajes clasificados por Laya")
+    p_mem.set_defaults(func=cmd_memory)
 
     # Systemctl wrappers
     p_status = subparsers.add_parser("status", help="Ver estado del servicio systemd")

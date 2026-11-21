@@ -1,21 +1,143 @@
+import asyncio
 import importlib
 import importlib.util
+import inspect
 import json
 import os
+import re
 import subprocess
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from celab_bot.config import CelabConfig
 from celab_bot.memory import UserMemoryStore
-from celab_bot.security import requires_user_confirmation
 from celab_bot.tools_registry import ToolsRegistry
 from celab_bot.users import get_user_home, get_user_data_dir
 
 
+_SPANISH_HINTS = {
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
+    "en", "por", "para", "que", "con", "sin", "haz", "dime", "lista",
+    "listar", "lee", "leer", "crea", "crear", "archivo", "archivos",
+    "carpeta", "carpetas", "directorio", "directorios", "hola", "si", "sí",
+    "no", "quiero", "necesito", "puedes", "como", "cómo", "cual", "cuál",
+    "donde", "dónde", "mi", "mis", "tu", "tus", "su", "sus", "este", "esta",
+    "esto", "hacer", "ejecutar", "comando", "buscar", "busca", "guarda",
+    "guardar", "borra", "borrar", "elimina", "eliminar", "muestra", "mostrar",
+    "texto", "espacio", "trabajo", "servidor", "usuario", "memoria", "porfa",
+    "favor", "gracias", "cambia", "edita", "editar", "ayuda", "clima",
+}
+
+
+def looks_like_english(text: str) -> bool:
+    """Heurística rápida para evitar traducir textos que ya están en inglés."""
+    if not text or not isinstance(text, str):
+        return True
+    s = text.strip()
+    if not s:
+        return True
+    if any(ch in s for ch in "áéíóúüñÁÉÍÓÚÜÑ¿¡"):
+        return False
+    tokens = set(re.findall(r"[a-zA-Z]+", s.lower()))
+    if not tokens:
+        return True
+    if tokens & _SPANISH_HINTS:
+        return False
+    return True
+
+
+def detect_repetition_loop(text: str) -> bool:
+    """Detecta bucles degenerados de repetición típicos de modelos cuantizados a 1-bit."""
+    if not text or len(text) < 220:
+        return False
+    tail = text[-900:]
+    return bool(re.search(r"(.{20,120}?)\1{4,}", tail, flags=re.DOTALL))
+
+
+def extract_fallback_tool_calls(
+    content: str,
+    available_tools: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """
+    Parser de respaldo para cuando llama.cpp / Bonsai-27b-Q1_0 emite una llamada a tool
+    en texto plano (<tool_call>{...}</tool_call> o bloque JSON) en lugar de msg.tool_calls.
+    """
+    if not content or not available_tools:
+        return []
+
+    valid_names = {
+        t.get("function", {}).get("name")
+        for t in available_tools
+        if isinstance(t, dict) and t.get("function", {}).get("name")
+    }
+    if not valid_names:
+        return []
+
+    candidates: List[str] = []
+    # 1. Etiquetas <tool_call>...</tool_call>
+    for m in re.finditer(r"<tool_call>([\s\S]*?)</tool_call>", content, flags=re.IGNORECASE):
+        inner = m.group(1).strip()
+        if inner.startswith("{") and inner.endswith("}"):
+            candidates.append(inner)
+
+    # 2. Bloques ```json ... ```
+    if not candidates:
+        for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", content, flags=re.IGNORECASE):
+            inner = m.group(1).strip()
+            if inner.startswith("{") and inner.endswith("}"):
+                candidates.append(inner)
+
+    # 3. JSON crudo si toda la respuesta es un objeto JSON
+    stripped = content.strip()
+    if not candidates and stripped.startswith("{") and stripped.endswith("}"):
+        candidates.append(stripped)
+
+    parsed_calls: List[Dict[str, Any]] = []
+    for raw in candidates:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        fn_name = obj.get("name") or obj.get("function") or obj.get("tool")
+        if isinstance(fn_name, dict):
+            fn_name = fn_name.get("name")
+        if fn_name not in valid_names:
+            continue
+
+        raw_args = obj.get("arguments")
+        if raw_args is None:
+            raw_args = obj.get("parameters")
+        if raw_args is None:
+            raw_args = obj.get("args", {})
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except Exception:
+                raw_args = {}
+        if not isinstance(raw_args, dict):
+            raw_args = {}
+
+        parsed_calls.append({
+            "id": f"call_fb_{uuid.uuid4().hex[:10]}",
+            "name": fn_name,
+            "arguments": raw_args,
+        })
+
+    return parsed_calls
+
 
 class AgentEngine:
     """Motor agéntico principal de CELab bot desacoplado de estado global."""
+
+    MEMORY_CATEGORIES = {
+        "user_preferences": "Identity memory: immutable rules, personal user preferences, language, formatting or style instructions",
+        "project_context": "Working memory: technical details of the user's current task or project (files, configs, errors, decisions)",
+        "general_knowledge": "Semantic memory: concepts, definitions, general facts or reusable code snippets",
+        "conversational_context": "Episodic memory: recent conversational thread, greetings, small talk, acknowledgements",
+    }
 
     def __init__(
         self,
@@ -33,10 +155,10 @@ class AgentEngine:
         self._translation_cache: Dict[str, str] = {}
 
     # ─────────────────────────────────────────────────────────────────────
-    # TRADUCCIÓN INCREMENTAL AL INGLÉS (CACHEADA PARA LAYA)
+    # TRADUCCIÓN INCREMENTAL AL INGLÉS (CON CACHÉ EN RAM + SQLITE)
     # ─────────────────────────────────────────────────────────────────────
-    def translate_to_english(self, text: str) -> str:
-        """Traduce un mensaje individual a inglés usando el LLM de forma concisa."""
+    async def atranslate_to_english(self, text: str) -> str:
+        """Traduce un texto a inglés de forma asíncrona con timeout acotado."""
         if not text or not isinstance(text, str):
             return ""
         text = text.strip()
@@ -44,24 +166,32 @@ class AgentEngine:
             return ""
         if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
             return text
+        if looks_like_english(text):
+            return text
+        if self.client is None:
+            return text
 
+        messages = [
+            {
+                "role": "system",
+                "content": "Translate the user message directly to concise English. Respond ONLY with the translation, no extra commentary or quotes.",
+            },
+            {"role": "user", "content": text[:800]},
+        ]
         try:
-            resp = self.client.chat.completions.create(
-                model=self.config.llm_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Translate the user message directly to concise English. Respond ONLY with the translation, no extra commentary or quotes."
-                    },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ],
-                max_tokens=120,
-                temperature=0.0
-            )
-            res = resp.choices[0].message.content.strip()
+            create_fn = self.client.chat.completions.create
+            kwargs = {
+                "model": self.config.llm_model,
+                "messages": messages,
+                "max_tokens": 120,
+                "temperature": 0.0,
+                "timeout": 15.0,
+            }
+            if inspect.iscoroutinefunction(create_fn):
+                resp = await create_fn(**kwargs)
+            else:
+                resp = await asyncio.to_thread(create_fn, **kwargs)
+            res = (resp.choices[0].message.content or "").strip()
             if res.startswith('"') and res.endswith('"') and len(res) > 1:
                 res = res[1:-1]
             return res if res else text
@@ -69,49 +199,68 @@ class AgentEngine:
             print(f"  ⚠️ [TRANSLATE] Error traduciendo a inglés: {e}")
             return text
 
-    def get_text_en(self, text: str) -> str:
-        """Obtiene y cachea la versión en inglés de un texto."""
+    async def aget_text_en(
+        self,
+        text: str,
+        memory_store: Optional[UserMemoryStore] = None,
+    ) -> str:
+        """Obtiene y cachea la versión en inglés (RAM -> SQLite -> LLM)."""
         if not text or not isinstance(text, str):
             return ""
         text_clean = text.strip()
+        if not text_clean:
+            return ""
         if text_clean in self._translation_cache:
             return self._translation_cache[text_clean]
-        en = self.translate_to_english(text_clean)
+        if looks_like_english(text_clean):
+            self._translation_cache[text_clean] = text_clean
+            return text_clean
+        if memory_store is not None:
+            cached = memory_store.get_translation(text_clean)
+            if cached:
+                self._translation_cache[text_clean] = cached
+                return cached
+
+        en = await self.atranslate_to_english(text_clean)
         self._translation_cache[text_clean] = en
+        if memory_store is not None and en:
+            memory_store.save_translation(text_clean, en)
         return en
 
-    def get_message_en(self, msg: Any) -> str:
-        """Obtiene la versión en inglés de un mensaje individual (1 sola vez)."""
+    async def aget_message_en(
+        self,
+        msg: Any,
+        memory_store: Optional[UserMemoryStore] = None,
+    ) -> str:
+        """Obtiene la versión en inglés de un mensaje individual sin retraducir."""
         if isinstance(msg, dict):
             if "_content_en" in msg:
                 return msg["_content_en"]
             content = msg.get("content", "")
-            en = self.get_text_en(content)
+            en = await self.aget_text_en(content, memory_store)
             msg["_content_en"] = en
             return en
-        else:
-            if hasattr(msg, "_content_en"):
-                return getattr(msg, "_content_en")
-            content = getattr(msg, "content", "")
-            en = self.get_text_en(content)
-            setattr(msg, "_content_en", en)
-            return en
+        if hasattr(msg, "_content_en"):
+            return getattr(msg, "_content_en")
+        content = getattr(msg, "content", "")
+        en = await self.aget_text_en(content, memory_store)
+        setattr(msg, "_content_en", en)
+        return en
 
     # ─────────────────────────────────────────────────────────────────────
-    # FILTRADO DE CONTEXTO CON LAYA (ENVÍO EN INGLÉS)
+    # FILTRADO DE CONTEXTO Y CLASIFICACIÓN EN SQLITE CON LAYA
     # ─────────────────────────────────────────────────────────────────────
-    def get_filtered_messages(
+    async def aget_filtered_messages(
         self,
         messages: List[Dict[str, Any]],
         current_task: str,
         memory_store: UserMemoryStore,
     ) -> List[Dict[str, Any]]:
         """
-        Filtra el historial de conversación con Laya Context Router.
-        A Laya se le envía todo en inglés (current_task y context_piece).
-        Al LLM se le devuelven los mensajes originales en español.
+        Filtra el historial de conversación con Laya Context Router (sin bloquear el event loop),
+        reutiliza traducciones/clasificaciones de SQLite y almacena recuerdos relevantes.
         """
-        if len(messages) <= 2:
+        if len(messages) <= 2 or self.context_router is None:
             return messages
 
         last_user_idx = len(messages) - 1
@@ -122,17 +271,12 @@ class AgentEngine:
                 last_user_idx = i
                 break
 
-        current_task_en = self.get_text_en(current_task)
+        current_task_en = await self.aget_text_en(current_task, memory_store)
         filtered = [messages[0]]  # System prompt
 
-        memory_categories = {
-            "user_preferences": "Identity memory: immutable rules, personal user preferences, language, formatting or style instructions",
-            "project_context": "Working memory: technical details of the user's current task or project (files, configs, errors, decisions)",
-            "general_knowledge": "Semantic memory: concepts, definitions, general facts or reusable code snippets",
-            "conversational_context": "Episodic memory: recent conversational thread, greetings, small talk, acknowledgements"
-        }
-
-        i = 1
+        # Acotar evaluación a los últimos 16 mensajes previos para evitar latencia en chats muy largos
+        start_idx = max(1, last_user_idx - 16)
+        i = start_idx
         while i < last_user_idx:
             msg = messages[i]
             role = msg.get("role") if isinstance(msg, dict) else msg.role
@@ -141,11 +285,15 @@ class AgentEngine:
 
             block = [msg]
             content_for_eval = str(content) if content else ""
-            msg_en = self.get_message_en(msg)
+            msg_en = await self.aget_message_en(msg, memory_store)
             content_for_eval_en = f"Role: {role}, Content: {msg_en}"
 
             if tool_calls:
-                tc_name = tool_calls[0].get("function", {}).get("name") if isinstance(tool_calls[0], dict) else tool_calls[0].function.name
+                tc_name = (
+                    tool_calls[0].get("function", {}).get("name")
+                    if isinstance(tool_calls[0], dict)
+                    else tool_calls[0].function.name
+                )
                 content_for_eval += f" [Llamada a tool: {tc_name}]"
                 content_for_eval_en += f" [Tool call: {tc_name}]"
 
@@ -154,8 +302,12 @@ class AgentEngine:
                     next_role = next_msg.get("role") if isinstance(next_msg, dict) else next_msg.role
                     if next_role == "tool":
                         block.append(next_msg)
-                        next_content = next_msg.get("content") if isinstance(next_msg, dict) else getattr(next_msg, "content", "")
-                        next_en = self.get_message_en(next_msg)
+                        next_content = (
+                            next_msg.get("content")
+                            if isinstance(next_msg, dict)
+                            else getattr(next_msg, "content", "")
+                        )
+                        next_en = await self.aget_message_en(next_msg, memory_store)
                         content_for_eval += f" [Resultado: {str(next_content)[:100]}]"
                         content_for_eval_en += f" [Result: {str(next_en)[:100]}]"
                         i += 1
@@ -165,46 +317,64 @@ class AgentEngine:
                 next_role = next_msg.get("role") if isinstance(next_msg, dict) else next_msg.role
                 if next_role == "assistant":
                     block.append(next_msg)
-                    next_content = next_msg.get("content") if isinstance(next_msg, dict) else getattr(next_msg, "content", "")
-                    asst_en = self.get_message_en(next_msg)
+                    next_content = (
+                        next_msg.get("content")
+                        if isinstance(next_msg, dict)
+                        else getattr(next_msg, "content", "")
+                    )
+                    asst_en = await self.aget_message_en(next_msg, memory_store)
                     content_for_eval = f"User: {content_for_eval} | Assistant: {str(next_content)}"
                     content_for_eval_en = f"Role: user, Content: {msg_en}\nRole: assistant, Content: {asst_en}"
                     i += 1
 
+            cached_cls = memory_store.get_cached_message_classification(content_for_eval)
             state = {
                 "current_task": current_task_en,
-                "context_piece": content_for_eval_en
+                "context_piece": content_for_eval_en,
             }
             questions = {
                 "is_relevant": {
                     "type": "noul",
-                    "instructions": "Is this exchange strictly necessary to solve the current task?"
+                    "instructions": "Is this exchange strictly necessary to solve the current task?",
                 },
                 "should_store": {
                     "type": "noul",
-                    "instructions": "Does this exchange contain at least one piece of information worth saving in long-term memory for future conversations?"
+                    "instructions": "Does this exchange contain at least one piece of information worth saving in long-term memory for future conversations?",
                 },
                 "memory_type": {
                     "type": "choice",
                     "instructions": "Which type of memory does the most important information in this exchange belong to?",
-                    "criteria": memory_categories
-                }
+                    "criteria": self.MEMORY_CATEGORIES,
+                },
             }
 
             try:
-                res = self.context_router.predict(state, questions)
+                res = await asyncio.to_thread(self.context_router.predict, state, questions)
                 ans = res.get("answers", {})
-                prob_yes = ans.get("is_relevant", {}).get("noul", 0.0)
-                prob_store = ans.get("should_store", {}).get("noul", 0.0)
+                prob_yes = float(ans.get("is_relevant", {}).get("noul", 0.0))
+                prob_store = float(ans.get("should_store", {}).get("noul", 0.0))
                 category = ans.get("memory_type", {}).get("choice")
 
-                # RELEVANCIA
+                if not cached_cls:
+                    memory_store.log_message(
+                        role=role,
+                        content=content_for_eval,
+                        content_en=content_for_eval_en,
+                        category=category,
+                        is_relevant_score=prob_yes,
+                        should_store_score=prob_store,
+                    )
+
                 if prob_yes > 0.5:
                     filtered.extend(block)
 
-                # PERSISTENCIA EN MEMORIA DEL USUARIO
                 if prob_store > 0.5 and category in memory_store.CATEGORIES:
-                    memory_store.add(category, content_for_eval)
+                    memory_store.add(
+                        category=category,
+                        content=content_for_eval,
+                        content_en=content_for_eval_en,
+                        importance=prob_store,
+                    )
 
             except Exception as e:
                 print(f"⚠️ [CONTEXT] Error evaluando memoria: {e}. Reteniendo.")
@@ -215,22 +385,113 @@ class AgentEngine:
         filtered.extend(messages[last_user_idx:])
         return filtered
 
+    async def aclassify_and_store_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        memory_store: UserMemoryStore,
+    ) -> None:
+        """Clasifica el turno recién completado en segundo plano y lo guarda en SQLite."""
+        if self.context_router is None:
+            return
+        user_clean = (user_text or "").strip()
+        asst_clean = (assistant_text or "").strip()
+        if not user_clean or not asst_clean:
+            return
+
+        content_es = f"User: {user_clean} | Assistant: {asst_clean[:600]}"
+        if memory_store.get_cached_message_classification(content_es):
+            return
+
+        try:
+            user_en = await self.aget_text_en(user_clean, memory_store)
+            asst_en = await self.aget_text_en(asst_clean[:600], memory_store)
+            content_en = f"Role: user, Content: {user_en}\nRole: assistant, Content: {asst_en}"
+
+            state = {
+                "current_task": user_en,
+                "context_piece": content_en,
+            }
+            questions = {
+                "should_store": {
+                    "type": "noul",
+                    "instructions": "Does this exchange contain at least one piece of information worth saving in long-term memory for future conversations?",
+                },
+                "memory_type": {
+                    "type": "choice",
+                    "instructions": "Which type of memory does the most important information in this exchange belong to?",
+                    "criteria": self.MEMORY_CATEGORIES,
+                },
+            }
+            res = await asyncio.to_thread(self.context_router.predict, state, questions)
+            ans = res.get("answers", {})
+            prob_store = float(ans.get("should_store", {}).get("noul", 0.0))
+            category = ans.get("memory_type", {}).get("choice")
+
+            memory_store.log_message(
+                role="exchange",
+                content=content_es,
+                content_en=content_en,
+                category=category,
+                is_relevant_score=1.0,
+                should_store_score=prob_store,
+            )
+
+            if prob_store > 0.5 and category in memory_store.CATEGORIES:
+                added = memory_store.add(
+                    category=category,
+                    content=content_es,
+                    content_en=content_en,
+                    importance=prob_store,
+                )
+                if added:
+                    print(f"🧠 [MEMORY] Nuevo recuerdo guardado ({category}, score={prob_store:.2f}) para {memory_store.linux_user}")
+        except Exception as e:
+            print(f"⚠️ [MEMORY BG] Error clasificando turno en segundo plano: {e}")
+
+    async def abuild_memory_context(
+        self,
+        current_query: str,
+        memory_store: UserMemoryStore,
+    ) -> str:
+        """Recupera recuerdos relevantes de SQLite formateados para el System Prompt."""
+        try:
+            query_en = await self.aget_text_en(current_query, memory_store)
+            return memory_store.format_prompt_context(
+                query=current_query,
+                query_en=query_en,
+                max_items=self.config.max_memory_inject,
+            )
+        except Exception as e:
+            print(f"⚠️ [MEMORY] Error recuperando contexto de memoria: {e}")
+            return ""
+
     # ─────────────────────────────────────────────────────────────────────
-    # BÚSQUEDA DE TOOLS CON LAYA TOOL ROUTER
+    # BÚSQUEDA DE TOOLS CON LAYA TOOL ROUTER (ASYNC + TRADUCCIÓN + TOP-K)
     # ─────────────────────────────────────────────────────────────────────
-    def search_tools(
+    async def asearch_tools(
         self,
         query: str,
         linux_user: str,
+        memory_store: Optional[UserMemoryStore] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Busca herramientas y recetas usando Laya."""
+        """Busca herramientas y recetas usando Laya asegurando query en inglés y fallback Top-K."""
+        if self.tool_router is None:
+            print("⚠️ [LAYA TOOLS] tool_router no está cargado.")
+            return [], {}
+
+        query_en = await self.aget_text_en(query, memory_store)
+        excluded = {"run_terminal_command"} if self.config.always_include_terminal_tool else set()
+
         dynamic_tools, dynamic_recipes = self.tools_registry.load_dynamic_tools_and_recipes(linux_user)
-        builtins = self.tools_registry.get_builtin_tools()
+        builtins = self.tools_registry.get_builtin_tools(exclude_names=excluded)
 
         searchable = []
         desc_to_item = {}
 
         for tool in builtins + dynamic_tools:
+            if tool["function"]["name"] in excluded:
+                continue
             desc = tool["function"]["description"]
             desc_to_item[desc] = {"type": "tool", "schema": tool}
             searchable.append(desc)
@@ -244,29 +505,41 @@ class AgentEngine:
             return [], {}
 
         searchable.append("none of the above")
-        state = {"question": query}
+        state = {"question": query_en}
         questions = {
             "match": {
                 "type": "choice",
                 "instructions": "Which capability best matches what is needed?",
-                "criteria": searchable
+                "criteria": searchable,
             }
         }
 
         try:
-            result = self.tool_router.predict(state, questions)
+            result = await asyncio.to_thread(self.tool_router.predict, state, questions)
             match_ans = result.get("answers", {}).get("match", {})
             probabilities = match_ans.get("probabilities", {})
         except Exception as e:
             print(f"⚠️ [LAYA TOOLS] Error en search_tools: {e}")
             return [], {}
 
-        found_tools = []
-        found_recipes = {}
+        none_prob = float(probabilities.get("none of the above", 0.0))
+        scored_items = sorted(
+            [(desc, float(prob)) for desc, prob in probabilities.items() if desc != "none of the above"],
+            key=lambda x: x[1],
+            reverse=True,
+        )
 
-        for desc, prob in probabilities.items():
-            if desc == "none of the above":
-                continue
+        top_debug = [
+            f"{desc_to_item[d]['schema']['function']['name'] if desc_to_item[d]['type'] == 'tool' else desc_to_item[d]['name']}={p:.2f}"
+            for d, p in scored_items[:3]
+            if d in desc_to_item
+        ]
+        print(f"🔎 [LAYA TOOLS] query='{query}' (en='{query_en}') none={none_prob:.2f} top={top_debug}")
+
+        found_tools: List[Dict[str, Any]] = []
+        found_recipes: Dict[str, Any] = {}
+
+        for desc, prob in scored_items:
             if prob > self.config.search_threshold:
                 item = desc_to_item.get(desc)
                 if item and item["type"] == "tool":
@@ -274,8 +547,17 @@ class AgentEngine:
                     if schema not in found_tools:
                         found_tools.append(schema)
                 elif item and item["type"] == "recipe":
-                    name = item["name"]
-                    found_recipes[name] = item["recipe"]
+                    found_recipes[item["name"]] = item["recipe"]
+
+        # Red de seguridad Top-K: si nada pasó el threshold pero "none of the above" no domina
+        if not found_tools and not found_recipes and none_prob < 0.85:
+            for desc, prob in scored_items[:2]:
+                if prob >= 0.01:
+                    item = desc_to_item.get(desc)
+                    if item and item["type"] == "tool":
+                        found_tools.append(item["schema"])
+                    elif item and item["type"] == "recipe":
+                        found_recipes[item["name"]] = item["recipe"]
 
         return found_tools, found_recipes
 
@@ -290,14 +572,13 @@ class AgentEngine:
         is_admin: bool,
     ) -> Dict[str, Any]:
         """Ejecuta una herramienta como el usuario Linux correspondiente."""
-        # Modo multiusuario en Linux: usar celab-exec mediante sudo -u
         if not self.config.single_user_mode and os.name == "posix":
             cmd = ["sudo", "-u", linux_user, str(self.config.exec_binary)]
             payload = json.dumps({
                 "tool": tool_name,
                 "args": args,
                 "user": linux_user,
-                "is_admin": is_admin
+                "is_admin": is_admin,
             })
             try:
                 res = subprocess.run(
@@ -306,7 +587,7 @@ class AgentEngine:
                     text=True,
                     capture_output=True,
                     timeout=30.0,
-                    cwd="/tmp"
+                    cwd="/tmp",
                 )
                 if res.returncode != 0:
                     return {"error": f"Error ejecutando como {linux_user}: {res.stderr}"}
@@ -314,7 +595,6 @@ class AgentEngine:
             except Exception as e:
                 return {"error": f"Error llamando celab-exec: {e}"}
 
-        # Modo local / Dev fallback: ejecución directa
         return self._execute_tool_locally(tool_name, args, linux_user, is_admin)
 
     def _execute_tool_locally(
@@ -324,7 +604,7 @@ class AgentEngine:
         linux_user: str,
         is_admin: bool,
     ) -> Dict[str, Any]:
-        """Ejecución directa en el mismo proceso (fallback dev)."""
+        """Ejecución directa en el mismo proceso (fallback dev o dentro de celab-exec)."""
         home = get_user_home(linux_user)
 
         if tool_name == "list_files_in_dir":
@@ -340,7 +620,15 @@ class AgentEngine:
             target = (home / path).resolve() if not path.is_absolute() else path
             try:
                 with open(target, "r", encoding="utf-8") as f:
-                    return {"content": f.read()}
+                    data = f.read()
+                # Truncar lecturas enormes para proteger la ventana de contexto de Bonsai
+                if len(data) > 12000:
+                    return {
+                        "content": data[:12000],
+                        "truncated": True,
+                        "total_chars": len(data),
+                    }
+                return {"content": data}
             except Exception as e:
                 return {"error": str(e)}
 
@@ -380,7 +668,11 @@ class AgentEngine:
             params = args.get("parameters")
             code = args.get("code")
 
-            target_dir = self.config.shared_dir / "tools" if scope == "general" else get_user_data_dir(linux_user) / "tools"
+            target_dir = (
+                self.config.shared_dir / "tools"
+                if scope == "general"
+                else get_user_data_dir(linux_user) / "tools"
+            )
             target_dir.mkdir(parents=True, exist_ok=True)
 
             schema = {
@@ -388,10 +680,10 @@ class AgentEngine:
                 "function": {
                     "name": name,
                     "description": desc,
-                    "parameters": params if isinstance(params, dict) else json.loads(params)
+                    "parameters": params if isinstance(params, dict) else json.loads(params),
                 },
                 "scope": scope,
-                "author": linux_user
+                "author": linux_user,
             }
 
             with open(target_dir / f"{name}.json", "w", encoding="utf-8") as f:
@@ -408,9 +700,12 @@ class AgentEngine:
                 return {"error": "Solo administradores pueden crear recetas con scope 'general'."}
 
             name = args.get("name")
-            target_dir = self.config.shared_dir / "recipes" if scope == "general" else get_user_data_dir(linux_user) / "recipes"
+            target_dir = (
+                self.config.shared_dir / "recipes"
+                if scope == "general"
+                else get_user_data_dir(linux_user) / "recipes"
+            )
             target_dir.mkdir(parents=True, exist_ok=True)
-
 
             recipe_data = {
                 "name": name,
@@ -418,7 +713,7 @@ class AgentEngine:
                 "parameters": args.get("parameters", {}),
                 "steps": args.get("steps", []),
                 "scope": scope,
-                "author": linux_user
+                "author": linux_user,
             }
             with open(target_dir / f"{name}.json", "w", encoding="utf-8") as f:
                 json.dump(recipe_data, f, indent=4)
@@ -434,7 +729,7 @@ class AgentEngine:
 
             recipe = recipes[recipe_name]
             results = []
-            for i, step in enumerate(recipe.get("steps", [])):
+            for step in recipe.get("steps", []):
                 t_name = step["tool"]
                 raw_args = step.get("args", {})
                 resolved = {}
@@ -462,12 +757,18 @@ class AgentEngine:
                     capture_output=True,
                     text=True,
                     timeout=20,
-                    cwd=str(home)
+                    cwd=str(home),
                 )
+                stdout = res.stdout or ""
+                stderr = res.stderr or ""
+                if len(stdout) > 8000:
+                    stdout = stdout[:8000] + "\n... [salida truncada]"
+                if len(stderr) > 4000:
+                    stderr = stderr[:4000] + "\n... [stderr truncado]"
                 return {
-                    "stdout": res.stdout,
-                    "stderr": res.stderr,
-                    "returncode": res.returncode
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "returncode": res.returncode,
                 }
             except Exception as e:
                 return {"error": str(e)}
@@ -485,7 +786,7 @@ class AgentEngine:
         user_tools_dir, _ = self.tools_registry.get_user_dirs(linux_user)
         py_candidates = [
             user_tools_dir / f"{tool_name}.py",
-            self.config.shared_dir / "tools" / f"{tool_name}.py"
+            self.config.shared_dir / "tools" / f"{tool_name}.py",
         ]
         for py_path in py_candidates:
             if py_path.is_file():

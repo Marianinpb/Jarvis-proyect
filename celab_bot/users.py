@@ -108,11 +108,18 @@ def unlink_user(openwebui_id: str, path: Optional[Path] = None) -> Tuple[bool, s
 
 
 def get_linux_user(openwebui_id: str, path: Optional[Path] = None) -> Optional[str]:
-    """Obtiene el usuario Linux asociado al ID/nombre de OpenWebUI."""
+    """Obtiene el usuario Linux asociado al ID/nombre/email de OpenWebUI (búsqueda exacta y case-insensitive)."""
     if not openwebui_id:
         return None
     users = load_users(path)
-    return users.get(openwebui_id.strip())
+    key = openwebui_id.strip()
+    if key in users:
+        return users[key]
+    key_lower = key.lower()
+    for ow_key, lx_val in users.items():
+        if ow_key.strip().lower() == key_lower:
+            return lx_val
+    return None
 
 
 def is_admin_user(linux_user: str) -> bool:

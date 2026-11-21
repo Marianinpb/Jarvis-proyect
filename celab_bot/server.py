@@ -5,14 +5,18 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response, Security
+from fastapi import FastAPI, Header, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from celab_bot.config import CelabConfig, load_config
-from celab_bot.core import AgentEngine
+from celab_bot.core import (
+    AgentEngine,
+    detect_repetition_loop,
+    extract_fallback_tool_calls,
+)
 from celab_bot.memory import UserMemoryStore
 from celab_bot.security import requires_user_confirmation, format_confirmation_request
 from celab_bot.users import get_linux_user, is_admin_user
@@ -22,20 +26,17 @@ try:
 except ImportError:
     Router = None
 
-# Mapeo en memoria de confirmaciones pendientes de usuario: { linux_user: dict }
-PENDING_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
-
 AFFIRMATIVE_WORDS = {
     "si", "sí", "yes", "y", "s", "adelante", "procede", "proceder",
     "dale", "ok", "afirmativo", "confirmo", "confirmar", "hazlo",
     "ejecutar", "ejecútalo", "ejecutalo", "autorizo", "autorizado",
-    "claro", "por supuesto", "de acuerdo", "va"
+    "claro", "por supuesto", "de acuerdo", "va",
 }
 
 NEGATIVE_WORDS = {
     "no", "nop", "n", "cancelar", "cancela", "detener", "detén",
     "deten", "rechazar", "rechazo", "abortar", "abort", "para", "alto",
-    "negativo", "denegar"
+    "negativo", "denegar",
 }
 
 INTERNAL_TASK_MARKERS = (
@@ -58,10 +59,12 @@ def strip_ui_blocks(text: str) -> str:
     """Limpia bloques <details> y alertas de seguridad del historial antes de enviarlo al LLM."""
     if not text or not isinstance(text, str):
         return ""
-    # Remover bloques <details>...</details>
     cleaned = re.sub(r"<details[\s\S]*?</details>", "", text)
-    # Remover cartel de confirmación de seguridad si quedó en el historial
-    cleaned = re.sub(r"⚠️ \*\*Confirmación de Seguridad Requerida\*\*[\s\S]*?buscar una alternativa\.", "", cleaned)
+    cleaned = re.sub(
+        r"⚠️ \*\*Confirmación de Seguridad Requerida\*\*[\s\S]*?buscar una alternativa\.",
+        "",
+        cleaned,
+    )
     return cleaned.strip()
 
 
@@ -79,14 +82,32 @@ def check_confirmation_intent(text: str) -> Optional[bool]:
     return None
 
 
+def _looks_like_raw_tool_prefix(buf: str) -> bool:
+    """Detecta si el texto inicial podría ser un <tool_call> o bloque JSON emitido en texto."""
+    s = buf.lstrip()
+    if not s:
+        return True
+    return s.startswith("<") or s.startswith("{") or s.startswith("```")
+
+
+def _summarize_tool_signatures(tools: List[Dict[str, Any]]) -> List[str]:
+    sigs = []
+    for t in tools:
+        fn = t.get("function", {})
+        name = fn.get("name", "")
+        props = list(fn.get("parameters", {}).get("properties", {}).keys())
+        sigs.append(f"{name}({', '.join(props)})")
+    return sigs
+
+
 def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
     config = config or load_config()
 
     app = FastAPI(
         title="CELab Bot API",
-        version="2.0.0",
-        description="OpenAI-compatible server for OpenWebUI with Laya Routing and Multi-user Isolation",
+        version="2.1.0",
+        description="OpenAI-compatible async server for OpenWebUI with Laya Routing, SQLite Memory and Multi-user Isolation",
     )
 
     app.add_middleware(
@@ -99,8 +120,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
     security = HTTPBearer(auto_error=False)
 
-    # Inicializar OpenAI client para el LLM local
-    llm_client = OpenAI(
+    # Cliente asíncrono para no bloquear el event loop de FastAPI
+    llm_client = AsyncOpenAI(
         base_url=config.llm_base_url,
         api_key=config.llm_api_key,
         timeout=config.llm_timeout,
@@ -144,6 +165,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
             "status": "healthy",
             "model": config.llm_model,
             "backend": config.llm_base_url,
+            "laya_loaded": tool_router is not None and context_router is not None,
         }
 
     @app.get("/v1/models")
@@ -202,16 +224,25 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         current_query = ""
         for m in reversed(messages):
             if m.get("role") == "user":
-                current_query = m.get("content", "")
+                raw_c = m.get("content", "")
+                if isinstance(raw_c, list):
+                    current_query = " ".join(
+                        p.get("text", "") for p in raw_c if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                else:
+                    current_query = str(raw_c)
                 break
 
-        # 0. Si es una petición automática en segundo plano de OpenWebUI (generar título, tags, sugerencias):
-        # Responder directamente con el LLM sin tocar PENDING_CONFIRMATIONS ni invocar herramientas.
+        # 0. Peticiones automáticas en segundo plano de OpenWebUI (títulos, tags, sugerencias):
+        # Responder directo, asíncrono y con límite corto sin tocar memoria ni confirmaciones.
         if is_openwebui_background_task(current_query):
             try:
-                bg_resp = llm_client.chat.completions.create(
+                bg_resp = await llm_client.chat.completions.create(
                     model=config.llm_model,
                     messages=messages,
+                    max_tokens=128,
+                    temperature=0.2,
+                    timeout=25.0,
                 )
                 bg_text = bg_resp.choices[0].message.content or ""
             except Exception:
@@ -223,27 +254,35 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
                 return StreamingResponse(bg_stream(), media_type="text/event-stream")
-            else:
-                return {
-                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": "celab-bot",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": bg_text},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "celab-bot",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": bg_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
 
-        # Detectar identidad de OpenWebUI
-        user_identity = x_openwebui_user_name or x_openwebui_user_email or x_openwebui_user_id
-        if not user_identity and messages:
-            user_identity = "default_user"
-
-        linux_user = get_linux_user(user_identity, config.users_file)
+        # Detectar identidad de OpenWebUI probando todos los headers candidatos
+        candidates = [
+            c.strip()
+            for c in (x_openwebui_user_name, x_openwebui_user_email, x_openwebui_user_id, body.get("user"))
+            if isinstance(c, str) and c.strip()
+        ]
+        user_identity = candidates[0] if candidates else "default_user"
+        linux_user = None
+        for cand in candidates:
+            linux_user = get_linux_user(cand, config.users_file)
+            if linux_user:
+                user_identity = cand
+                break
+        if not linux_user and not candidates:
+            linux_user = get_linux_user("default_user", config.users_file)
 
         # Si el usuario NO está vinculado
         if not linux_user:
@@ -258,43 +297,35 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     yield sse_chunk(unlinked_msg)
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
-
                 return StreamingResponse(unlinked_stream(), media_type="text/event-stream")
-            else:
-                return {
-                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": "celab-bot",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": unlinked_msg},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "celab-bot",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": unlinked_msg},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
 
         is_admin = is_admin_user(linux_user)
         memory_store = UserMemoryStore(linux_user)
 
-        # Gestión del ciclo de confirmación en el harness
-        pending = PENDING_CONFIRMATIONS.get(linux_user)
+        # Gestión del ciclo de confirmación persistente en SQLite
+        pending = memory_store.get_pending_confirmation(ttl_seconds=900)
         action_executed_info = None
         action_denied_info = None
 
         if pending:
-            # Expirar confirmaciones pendientes tras 15 minutos (900 seg)
-            if time.time() - pending.get("timestamp", 0) > 900:
-                PENDING_CONFIRMATIONS.pop(linux_user, None)
-                pending = None
-
-        if pending:
             intent = check_confirmation_intent(current_query)
             if intent is True:
-                # El usuario AUTORIZÓ la acción: el harness la ejecuta de inmediato
-                PENDING_CONFIRMATIONS.pop(linux_user, None)
-                tool_res = engine.execute_tool(
+                memory_store.clear_pending_confirmation()
+                tool_res = await asyncio.to_thread(
+                    engine.execute_tool,
                     pending["tool_name"],
                     pending["args"],
                     linux_user,
@@ -308,44 +339,58 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     "result": tool_res,
                 }
             elif intent is False:
-                # El usuario DENEGÓ la acción
-                PENDING_CONFIRMATIONS.pop(linux_user, None)
+                memory_store.clear_pending_confirmation()
                 action_denied_info = {
                     "tool_name": pending["tool_name"],
                     "description": pending["description"],
                     "quest": pending["quest"],
                 }
             else:
-                # Mensaje nuevo no relacionado con la confirmación: descartar acción pendiente previa
-                PENDING_CONFIRMATIONS.pop(linux_user, None)
+                memory_store.clear_pending_confirmation()
 
-        # Iniciar System Prompt personalizado para CELab bot
-        system_content = (
-            f"Eres CELab bot, el asistente inteligente del laboratorio. "
-            f"Estás interactuando con el usuario Linux '{linux_user}'{' (ADMINISTRADOR)' if is_admin else ''}. "
-            f"Tienes acceso a la herramienta search_tools para descubrir habilidades cuando sea necesario. "
-            f"Usa search_tools con una descripción EN INGLÉS ÚNICAMENTE cuando la tarea requiera "
-            f"interactuar con el sistema (archivos, terminal, recetas, clima o herramientas externas). "
-            f"Para conversaciones generales, saludos, dudas de física o preguntas personales, responde directamente."
+        # Recuperar recuerdos persistentes relevantes de SQLite para inyectar al System Prompt
+        memory_context = await engine.abuild_memory_context(current_query, memory_store)
+
+        terminal_hint = (
+            "También tienes disponible directamente `run_terminal_command` para ejecutar comandos bash "
+            "cuando no haya una herramienta especializada más directa. "
+            if config.always_include_terminal_tool
+            else ""
         )
 
-        # Limpiar bloques de interfaz (<details> y carteles de confirmación) de los mensajes previos del asistente
-        cleaned_messages = []
+        # Único System Prompt al inicio (regla estricta de plantilla Jinja en Bonsai-27b)
+        system_content = (
+            f"Eres CELab bot, el asistente inteligente del laboratorio. "
+            f"Estás interactuando con el usuario Linux '{linux_user}'{' (ADMINISTRADOR)' if is_admin else ''}.\n"
+            f"REGLAS DE HERRAMIENTAS:\n"
+            f"1. Usa `search_tools` con una descripción EN INGLÉS cuando necesites descubrir herramientas "
+            f"especializadas (listar directorios, leer/editar archivos, búsqueda web, recetas o tools creadas).\n"
+            f"2. {terminal_hint}"
+            f"3. Cuando `search_tools` desbloquee una herramienta o ya tengas la herramienta disponible, "
+            f"INVÓCALA directamente mediante tool call en lugar de solo explicar qué comando usar.\n"
+            f"4. Para conversaciones generales, saludos o dudas teóricas que no requieran el sistema, responde directamente en español."
+            f"{memory_context}"
+        )
+
+        # Limpiar bloques de interfaz (<details> y carteles de confirmación) y normalizar roles
+        cleaned_messages: List[Dict[str, Any]] = []
         for m in messages:
-            m_copy = dict(m)
-            if m_copy.get("role") == "assistant" and isinstance(m_copy.get("content"), str):
+            role = m.get("role")
+            if role == "system":
+                continue  # El único system prompt lo colocamos en posición 0
+            m_copy: Dict[str, Any] = {"role": role, "content": m.get("content", "")}
+            if isinstance(m_copy["content"], list):
+                m_copy["content"] = " ".join(
+                    p.get("text", "") for p in m_copy["content"] if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if role == "assistant" and isinstance(m_copy["content"], str):
                 c_clean = strip_ui_blocks(m_copy["content"])
                 m_copy["content"] = c_clean if c_clean else "(Esperando respuesta del usuario)"
             cleaned_messages.append(m_copy)
 
-        # Asegurar mensaje de sistema al inicio
-        prepared_messages = list(cleaned_messages)
-        if not prepared_messages or prepared_messages[0].get("role") != "system":
-            prepared_messages.insert(0, {"role": "system", "content": system_content})
-        else:
-            prepared_messages[0]["content"] = system_content
+        prepared_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}] + cleaned_messages
 
-        # Inyectar contexto al modelo según la decisión del usuario (en el último mensaje de usuario para respetar plantillas Jinja que exigen system solo al inicio)
+        # Inyectar contexto de confirmación dentro del último mensaje user (respetando Jinja single-system)
         if action_executed_info:
             exec_note = (
                 f"\n\n[ACCIÓN AUTORIZADA Y EJECUTADA DIRECTAMENTE POR EL HARNESS]:\n"
@@ -375,26 +420,37 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
             else:
                 prepared_messages.append({"role": "user", "content": denied_note})
 
-        # Filtrar contexto con Laya (si hubo autorización/denegación, mantener prepared_messages intacto)
+        # Filtrar contexto con Laya (asíncrono, usando caché de SQLite)
         if action_executed_info or action_denied_info:
             filtered_msgs = prepared_messages
         else:
-            filtered_msgs = engine.get_filtered_messages(prepared_messages, current_query, memory_store)
+            filtered_msgs = await engine.aget_filtered_messages(prepared_messages, current_query, memory_store)
 
-        # Iniciar ciclo de respuesta agéntica con streaming
+        # Limpiar claves internas (_content_en) antes de mandar al LLM
+        def sanitize_for_llm(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            clean = []
+            for item in msgs:
+                if isinstance(item, dict):
+                    clean.append({k: v for k, v in item.items() if not k.startswith("_")})
+                else:
+                    clean.append(item)
+            return clean
+
         async def response_generator() -> AsyncGenerator[str, None]:
-            discovered_tools = []
-            # Si ya acabamos de ejecutar la acción autorizada, no le pasamos tools en el primer paso para evitar que las re-invoque
-            active_tools = None if action_executed_info else engine.tools_registry.get_core_tools()
-            conversation_history = list(filtered_msgs)
+            discovered_tools: List[Dict[str, Any]] = []
+            core_tools = engine.tools_registry.get_core_tools(
+                include_terminal=config.always_include_terminal_tool
+            )
+            active_tools: Optional[List[Dict[str, Any]]] = None if action_executed_info else list(core_tools)
+            conversation_history: List[Dict[str, Any]] = sanitize_for_llm(list(filtered_msgs))
+            final_assistant_text = ""
 
-            # Si acabamos de ejecutar una acción autorizada, mostrar su bloque colapsable de inmediato
             if action_executed_info:
                 t_name = action_executed_info["tool_name"]
                 t_desc = action_executed_info["description"]
                 t_res = action_executed_info["result"]
                 res_str = json.dumps(t_res, ensure_ascii=False, indent=2)
-                preview = (res_str[:300] + "...") if len(res_str) > 300 else res_str
+                preview = (res_str[:400] + "...") if len(res_str) > 400 else res_str
                 yield sse_chunk(
                     f"\n<details open><summary>✅ <b>Acción autorizada y ejecutada:</b> <code>{t_name}</code></summary>\n\n"
                     f"**Operación:** {t_desc}\n\n"
@@ -403,120 +459,241 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                 )
             elif action_denied_info:
                 t_desc = action_denied_info["description"]
-                yield sse_chunk(
-                    f"\n> 🚫 **Acción cancelada:** No se ejecutó {t_desc}.\n\n"
-                )
+                yield sse_chunk(f"\n> 🚫 **Acción cancelada:** No se ejecutó {t_desc}.\n\n")
 
-            while True:
-                # 1. Llamar al LLM
+            for step_idx in range(config.max_agent_steps):
+                # 1. Llamar al LLM en modo streaming real con guardrails contra cuelgues
+                content_buf = ""
+                streamed_live = False
+                aborted_loop = False
+                tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+
+                llm_kwargs: Dict[str, Any] = {
+                    "model": config.llm_model,
+                    "messages": conversation_history,
+                    "max_tokens": config.llm_max_tokens,
+                    "temperature": config.llm_temperature,
+                    "stream": True,
+                    "extra_body": {"repeat_penalty": config.llm_repeat_penalty},
+                }
+                if active_tools:
+                    llm_kwargs["tools"] = active_tools
+                    llm_kwargs["tool_choice"] = "auto"
+
                 try:
-                    chat_resp = llm_client.chat.completions.create(
-                        model=config.llm_model,
-                        messages=conversation_history,
-                        tools=active_tools if active_tools else None,
-                    )
+                    llm_stream = await llm_client.chat.completions.create(**llm_kwargs)
+                    async for chunk in llm_stream:
+                        if await request.is_disconnected():
+                            await llm_stream.close()
+                            return
+
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
+
+                        # Acumular tool_calls en streaming
+                        if delta.tool_calls:
+                            for tc_delta in delta.tool_calls:
+                                idx = tc_delta.index if tc_delta.index is not None else 0
+                                if idx not in tool_calls_acc:
+                                    tool_calls_acc[idx] = {
+                                        "id": tc_delta.id or f"call_{uuid.uuid4().hex[:10]}",
+                                        "name": "",
+                                        "arguments": "",
+                                    }
+                                if tc_delta.id:
+                                    tool_calls_acc[idx]["id"] = tc_delta.id
+                                if tc_delta.function:
+                                    if tc_delta.function.name:
+                                        tool_calls_acc[idx]["name"] += tc_delta.function.name
+                                    if tc_delta.function.arguments:
+                                        tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+
+                        # Acumular y transmitir contenido textual
+                        if delta.content:
+                            content_buf += delta.content
+                            if detect_repetition_loop(content_buf):
+                                aborted_loop = True
+                                print(f"⚠️ [BONSAI GUARD] Bucle de repetición detectado en paso {step_idx + 1}. Abortando stream.")
+                                await llm_stream.close()
+                                break
+
+                            if not tool_calls_acc:
+                                if streamed_live:
+                                    yield sse_chunk(delta.content)
+                                elif len(content_buf) >= 24 and not _looks_like_raw_tool_prefix(content_buf):
+                                    streamed_live = True
+                                    yield sse_chunk(content_buf)
+
                 except Exception as err:
                     yield sse_chunk(f"\n❌ Error al comunicarse con el modelo local: {err}\n")
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     return
 
-                msg = chat_resp.choices[0].message
-                content = msg.content or ""
-                tool_calls = msg.tool_calls or []
+                # Normalizar tool calls nativas
+                normalized_calls: List[Dict[str, Any]] = []
+                for idx in sorted(tool_calls_acc.keys()):
+                    tc_item = tool_calls_acc[idx]
+                    fn_name = tc_item["name"].strip()
+                    raw_args = tc_item["arguments"]
+                    try:
+                        parsed_args = json.loads(raw_args) if raw_args else {}
+                    except Exception:
+                        parsed_args = {}
+                    if fn_name:
+                        normalized_calls.append({
+                            "id": tc_item["id"],
+                            "name": fn_name,
+                            "arguments": parsed_args if isinstance(parsed_args, dict) else {},
+                        })
 
-                conversation_history.append(msg)
+                # Fallback: si llama.cpp no parseó tool_calls pero el modelo escribió <tool_call>/JSON en content
+                if not normalized_calls and not streamed_live and active_tools:
+                    fallback_calls = extract_fallback_tool_calls(content_buf, active_tools)
+                    if fallback_calls:
+                        print(f"🩹 [FALLBACK PARSER] Rescatadas {len(fallback_calls)} tool calls desde texto plano.")
+                        normalized_calls = fallback_calls
+                        content_buf = ""
 
-                # Si NO hay llamadas a tools, emitir respuesta final
-                if not tool_calls:
-                    yield sse_chunk(content)
+                # Si NO hay tool calls, cerrar respuesta final
+                if not normalized_calls:
+                    if not streamed_live and content_buf:
+                        yield sse_chunk(content_buf)
+                    if aborted_loop:
+                        yield sse_chunk("\n\n*(Respuesta truncada automáticamente al detectar repetición del modelo local.)*")
+                    final_assistant_text = content_buf
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
-                    break
 
-                # Si HAY tool calls, procesarlas
-                for tc in tool_calls:
-                    fn_name = tc.function.name
-                    raw_args = tc.function.arguments
-                    try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    except Exception:
-                        args = {}
+                    # Clasificar y almacenar el turno recién completado en SQLite en segundo plano
+                    if not action_executed_info and not action_denied_info and final_assistant_text.strip():
+                        asyncio.create_task(
+                            engine.aclassify_and_store_turn(current_query, final_assistant_text, memory_store)
+                        )
+                    return
 
-                    # Emitir bloque colapsable en Markdown para OpenWebUI
+                # Registrar mensaje del asistente como dict limpio (evita fallos de plantilla Jinja en llama.cpp)
+                assistant_msg: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content_buf or "",
+                    "tool_calls": [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {
+                                "name": c["name"],
+                                "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                            },
+                        }
+                        for c in normalized_calls
+                    ],
+                }
+                conversation_history.append(assistant_msg)
+
+                # Procesar cada tool call
+                for call in normalized_calls:
+                    fn_name = call["name"]
+                    args = call["arguments"]
+                    tc_id = call["id"]
+
                     yield sse_chunk(f"\n<details><summary>🛠️ <i>Llamando herramienta: <code>{fn_name}</code></i></summary>\n\n")
 
-                    # Caso especial: search_tools
                     if fn_name == "search_tools":
                         query = args.get("query", "")
-                        found_t, found_r = engine.search_tools(query, linux_user)
+                        found_t, found_r = await engine.asearch_tools(query, linux_user, memory_store)
+                        existing_names = {t["function"]["name"] for t in core_tools + discovered_tools}
                         for ft in found_t:
-                            if ft not in discovered_tools:
+                            t_name = ft["function"]["name"]
+                            if t_name not in existing_names:
                                 discovered_tools.append(ft)
-                        active_tools = engine.tools_registry.get_core_tools() + discovered_tools
+                                existing_names.add(t_name)
+                        active_tools = list(core_tools) + discovered_tools
+
+                        sigs = _summarize_tool_signatures(found_t)
+                        if found_t or found_r:
+                            guidance = (
+                                f"Tools unlocked and ready to call now: {', '.join(sigs)}. "
+                                f"CALL the appropriate tool now via a tool call to complete the user request."
+                            )
+                        else:
+                            guidance = (
+                                "No specialized tool matched. "
+                                + (
+                                    "You can use `run_terminal_command` directly if shell execution is needed."
+                                    if config.always_include_terminal_tool
+                                    else "Answer directly or refine your English search query."
+                                )
+                            )
 
                         tool_res = {
                             "found_tools": [t["function"]["name"] for t in found_t],
+                            "signatures": sigs,
                             "found_recipes": list(found_r.keys()),
-                            "message": f"Se descubrieron {len(found_t)} herramientas y {len(found_r)} recetas."
+                            "message": guidance,
                         }
                     else:
-                        # Verificar confirmación para herramientas destructivas
                         req_confirm, desc = requires_user_confirmation(fn_name, args)
                         if req_confirm and config.require_confirmation:
-                            PENDING_CONFIRMATIONS[linux_user] = {
-                                "tool_name": fn_name,
-                                "args": args,
-                                "description": desc,
-                                "quest": current_query,
-                                "timestamp": time.time(),
-                            }
-                            confirm_text = format_confirmation_request(tc.id, fn_name, desc, current_query)
-                            # Cerrar el bloque de detalles para que la solicitud quede visible afuera
+                            memory_store.set_pending_confirmation(
+                                tool_name=fn_name,
+                                args=args,
+                                description=desc,
+                                quest=current_query,
+                            )
+                            confirm_text = format_confirmation_request(tc_id, fn_name, desc, current_query)
                             yield sse_chunk(f"⏳ <i>Esperando autorización del usuario...</i>\n</details>\n\n{confirm_text}\n\n")
                             yield sse_chunk("", finish_reason="stop")
                             yield "data: [DONE]\n\n"
                             return
 
-                        # Ejecutar herramienta bajo la identidad de linux_user
-                        tool_res = engine.execute_tool(fn_name, args, linux_user, is_admin)
+                        tool_res = await asyncio.to_thread(
+                            engine.execute_tool, fn_name, args, linux_user, is_admin
+                        )
 
-                    # Mostrar resultado dentro del bloque details
                     res_str = json.dumps(tool_res, ensure_ascii=False, indent=2)
-                    preview = (res_str[:300] + "...") if len(res_str) > 300 else res_str
+                    preview = (res_str[:400] + "...") if len(res_str) > 400 else res_str
                     yield sse_chunk(f"```json\n{preview}\n```\n</details>\n\n")
 
                     conversation_history.append({
                         "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": json.dumps(tool_res, ensure_ascii=False)
+                        "tool_call_id": tc_id,
+                        "content": json.dumps(tool_res, ensure_ascii=False),
                     })
+
+            # Si se alcanzó el límite máximo de pasos agénticos
+            yield sse_chunk(
+                f"\n⚠️ Se alcanzó el límite máximo de pasos ({config.max_agent_steps}) para esta consulta. "
+                f"Indícame si deseas que continúe con un paso específico."
+            )
+            yield sse_chunk("", finish_reason="stop")
+            yield "data: [DONE]\n\n"
 
         if stream:
             return StreamingResponse(response_generator(), media_type="text/event-stream")
-        else:
-            full_content = ""
-            async for chunk in response_generator():
-                if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
-                    try:
-                        parsed = json.loads(chunk[6:].strip())
-                        c = parsed["choices"][0]["delta"].get("content", "")
-                        full_content += c
-                    except Exception:
-                        pass
 
-            return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": "celab-bot",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": full_content},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
+        full_content = ""
+        async for chunk in response_generator():
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                try:
+                    parsed = json.loads(chunk[6:].strip())
+                    c = parsed["choices"][0]["delta"].get("content", "")
+                    full_content += c
+                except Exception:
+                    pass
+
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "celab-bot",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": full_content},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
 
     return app
