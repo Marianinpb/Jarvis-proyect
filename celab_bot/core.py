@@ -481,7 +481,7 @@ class AgentEngine:
             return [], {}
 
         query_en = await self.aget_text_en(query, memory_store)
-        excluded = {"run_terminal_command"} if self.config.always_include_terminal_tool else set()
+        excluded = set()
 
         dynamic_tools, dynamic_recipes = self.tools_registry.load_dynamic_tools_and_recipes(linux_user)
         builtins = self.tools_registry.get_builtin_tools(exclude_names=excluded)

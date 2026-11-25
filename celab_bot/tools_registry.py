@@ -30,7 +30,7 @@ class ToolsRegistry:
             "type": "function",
             "function": {
                 "name": "run_terminal_command",
-                "description": "Executes a bash/shell command in the user's Linux terminal. Use when no specialized tool applies or when running shell utilities, scripts, git, python, or system checks.",
+                "description": "Executes a bash/shell command in the user's Linux terminal (e.g., ps, df, git, running scripts, package checks). Do NOT use cat/echo heredocs to write code files; use edit_file instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -111,7 +111,7 @@ class ToolsRegistry:
                 "type": "function",
                 "function": {
                     "name": "edit_file",
-                    "description": "Edits an existing text file by replacing old text with new text, or creates a simple text file. Do NOT use this to create agent tools or recipes.",
+                    "description": "Creates a new file (Python, HTML, CSS, JS, config, or text) with content, or edits an existing file by replacing old text with new text. Always prefer this over terminal commands for creating or modifying files. Do NOT use for agent tools/recipes.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -215,7 +215,7 @@ class ToolsRegistry:
                 "type": "function",
                 "function": {
                     "name": "run_terminal_command",
-                    "description": "Executes a command in the user's system shell and returns output. Runs as the requesting user.",
+                    "description": "Executes a bash/shell command in the user's Linux terminal (e.g., ps, df, git, running scripts, package checks). Do NOT use cat/echo heredocs to write code files; use edit_file instead.",
                     "parameters": {
                         "type": "object",
                         "properties": {

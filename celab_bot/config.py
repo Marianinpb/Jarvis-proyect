@@ -19,7 +19,7 @@ class CelabConfig:
     llm_model: str = "Bonsai-27b-Q1_0"
     llm_api_key: str = "no-key-needed"
     llm_timeout: float = 90.0
-    llm_max_tokens: int = 1024
+    llm_max_tokens: int = 4096
     llm_temperature: float = 0.2
     llm_repeat_penalty: float = 1.1
 

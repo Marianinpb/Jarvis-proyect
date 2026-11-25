@@ -65,6 +65,7 @@ def strip_ui_blocks(text: str) -> str:
         "",
         cleaned,
     )
+    cleaned = re.sub(r"(?:>\s*)?🚫\s*\*{0,2}Acción cancelada:\*{0,2}[^\n]*", "", cleaned)
     return cleaned.strip()
 
 
@@ -351,23 +352,14 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         # Recuperar recuerdos persistentes relevantes de SQLite para inyectar al System Prompt
         memory_context = await engine.abuild_memory_context(current_query, memory_store)
 
-        terminal_hint = (
-            "También tienes disponible directamente `run_terminal_command` para ejecutar comandos bash "
-            "cuando no haya una herramienta especializada más directa. "
-            if config.always_include_terminal_tool
-            else ""
-        )
-
         # Único System Prompt al inicio (regla estricta de plantilla Jinja en Bonsai-27b)
         system_content = (
             f"Eres CELab bot, el asistente inteligente del laboratorio. "
             f"Estás interactuando con el usuario Linux '{linux_user}'{' (ADMINISTRADOR)' if is_admin else ''}.\n"
             f"REGLAS DE HERRAMIENTAS:\n"
-            f"1. Usa `search_tools` con una descripción EN INGLÉS cuando necesites descubrir herramientas "
-            f"especializadas (listar directorios, leer/editar archivos, búsqueda web, recetas o tools creadas).\n"
-            f"2. {terminal_hint}"
-            f"3. Cuando `search_tools` desbloquee una herramienta o ya tengas la herramienta disponible, "
-            f"INVÓCALA directamente mediante tool call en lugar de solo explicar qué comando usar.\n"
+            f"1. Usa `search_tools` (con `query` EN INGLÉS) siempre que necesites interactuar con archivos, terminal, web o recetas.\n"
+            f"2. Para crear o modificar archivos (`.py`, `.html`, `.css`, `.txt`, configs), usa SIEMPRE `edit_file` (nunca `cat << EOF` en `run_terminal_command`). Usa `run_terminal_command` solo para comandos shell (`ps`, `df`, `git`, ejecutar scripts).\n"
+            f"3. Una vez que `search_tools` desbloquee las herramientas, INVOCA la herramienta adecuada directamente mediante tool call en lugar de solo mostrar el código en texto.\n"
             f"4. Para conversaciones generales, saludos o dudas teóricas que no requieran el sistema, responde directamente en español."
             f"{memory_context}"
         )
@@ -438,9 +430,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
         async def response_generator() -> AsyncGenerator[str, None]:
             discovered_tools: List[Dict[str, Any]] = []
-            core_tools = engine.tools_registry.get_core_tools(
-                include_terminal=config.always_include_terminal_tool
-            )
+            core_tools = engine.tools_registry.get_core_tools(include_terminal=False)
             active_tools: Optional[List[Dict[str, Any]]] = None if action_executed_info else list(core_tools)
             conversation_history: List[Dict[str, Any]] = sanitize_for_llm(list(filtered_msgs))
             final_assistant_text = ""
@@ -466,6 +456,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                 content_buf = ""
                 streamed_live = False
                 aborted_loop = False
+                finish_reason = None
                 tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
                 llm_kwargs: Dict[str, Any] = {
@@ -489,6 +480,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
                         if not chunk.choices:
                             continue
+                        if chunk.choices[0].finish_reason:
+                            finish_reason = chunk.choices[0].finish_reason
                         delta = chunk.choices[0].delta
 
                         # Acumular tool_calls en streaming
@@ -508,6 +501,13 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                                         tool_calls_acc[idx]["name"] += tc_delta.function.name
                                     if tc_delta.function.arguments:
                                         tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+                                        if detect_repetition_loop(tool_calls_acc[idx]["arguments"]):
+                                            aborted_loop = True
+                                            print(f"⚠️ [BONSAI GUARD] Bucle de repetición en argumentos de tool en paso {step_idx + 1}. Abortando stream.")
+                                            await llm_stream.close()
+                                            break
+                            if aborted_loop:
+                                break
 
                         # Acumular y transmitir contenido textual
                         if delta.content:
@@ -531,21 +531,49 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     yield "data: [DONE]\n\n"
                     return
 
-                # Normalizar tool calls nativas
+                # Normalizar tool calls nativas y validar argumentos antes de confirmar/ejecutar
                 normalized_calls: List[Dict[str, Any]] = []
                 for idx in sorted(tool_calls_acc.keys()):
                     tc_item = tool_calls_acc[idx]
                     fn_name = tc_item["name"].strip()
                     raw_args = tc_item["arguments"]
-                    try:
-                        parsed_args = json.loads(raw_args) if raw_args else {}
-                    except Exception:
-                        parsed_args = {}
+                    parse_error: Optional[str] = None
+                    parsed_args: Dict[str, Any] = {}
+
+                    if not raw_args or not raw_args.strip():
+                        parse_error = (
+                            f"Missing or empty JSON arguments for '{fn_name}' "
+                            f"(finish_reason={finish_reason})."
+                        )
+                    else:
+                        try:
+                            loaded = json.loads(raw_args)
+                            if isinstance(loaded, dict):
+                                parsed_args = loaded
+                            else:
+                                parse_error = f"Tool arguments for '{fn_name}' must be a JSON object."
+                        except Exception as je:
+                            trunc_note = " (truncated at max_tokens limit)" if finish_reason == "length" else ""
+                            parse_error = (
+                                f"Malformed/truncated JSON arguments for '{fn_name}'{trunc_note}: {je}."
+                            )
+
+                    if not parse_error:
+                        if fn_name == "run_terminal_command" and not (parsed_args.get("command") or "").strip():
+                            parse_error = (
+                                "Missing or empty 'command' argument (likely truncated). "
+                                "If creating a file, use edit_file instead of run_terminal_command."
+                            )
+                        elif fn_name == "edit_file" and not (parsed_args.get("path") or "").strip():
+                            parse_error = "Missing or empty 'path' argument (likely truncated)."
+
                     if fn_name:
                         normalized_calls.append({
                             "id": tc_item["id"],
                             "name": fn_name,
-                            "arguments": parsed_args if isinstance(parsed_args, dict) else {},
+                            "arguments": parsed_args,
+                            "raw_arguments": raw_args,
+                            "parse_error": parse_error,
                         })
 
                 # Fallback: si llama.cpp no parseó tool_calls pero el modelo escribió <tool_call>/JSON en content
@@ -562,6 +590,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                         yield sse_chunk(content_buf)
                     if aborted_loop:
                         yield sse_chunk("\n\n*(Respuesta truncada automáticamente al detectar repetición del modelo local.)*")
+                    elif finish_reason == "length":
+                        yield sse_chunk("\n\n*(Salida alcanzó el límite de tokens por turno; pídeme continuar si faltó una parte.)*")
                     final_assistant_text = content_buf
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
@@ -583,7 +613,11 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                             "type": "function",
                             "function": {
                                 "name": c["name"],
-                                "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                                "arguments": (
+                                    c["raw_arguments"]
+                                    if c.get("parse_error") and isinstance(c.get("raw_arguments"), str)
+                                    else json.dumps(c["arguments"], ensure_ascii=False)
+                                ),
                             },
                         }
                         for c in normalized_calls
@@ -599,7 +633,12 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
                     yield sse_chunk(f"\n<details><summary>🛠️ <i>Llamando herramienta: <code>{fn_name}</code></i></summary>\n\n")
 
-                    if fn_name == "search_tools":
+                    if call.get("parse_error"):
+                        tool_res = {
+                            "error": call["parse_error"],
+                            "hint": "Use edit_file for files; if content is very long, write a compact version or create it in two smaller edits.",
+                        }
+                    elif fn_name == "search_tools":
                         query = args.get("query", "")
                         found_t, found_r = await engine.asearch_tools(query, linux_user, memory_store)
                         existing_names = {t["function"]["name"] for t in core_tools + discovered_tools}
@@ -608,26 +647,24 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                             if t_name not in existing_names:
                                 discovered_tools.append(ft)
                                 existing_names.add(t_name)
+                        if config.always_include_terminal_tool and "run_terminal_command" not in existing_names:
+                            discovered_tools.append(engine.tools_registry.get_terminal_tool())
+                            existing_names.add("run_terminal_command")
                         active_tools = list(core_tools) + discovered_tools
 
-                        sigs = _summarize_tool_signatures(found_t)
-                        if found_t or found_r:
+                        sigs = _summarize_tool_signatures(discovered_tools)
+                        if discovered_tools or found_r:
                             guidance = (
                                 f"Tools unlocked and ready to call now: {', '.join(sigs)}. "
                                 f"CALL the appropriate tool now via a tool call to complete the user request."
                             )
                         else:
                             guidance = (
-                                "No specialized tool matched. "
-                                + (
-                                    "You can use `run_terminal_command` directly if shell execution is needed."
-                                    if config.always_include_terminal_tool
-                                    else "Answer directly or refine your English search query."
-                                )
+                                "No specialized tool matched. Answer directly or refine your English search query."
                             )
 
                         tool_res = {
-                            "found_tools": [t["function"]["name"] for t in found_t],
+                            "found_tools": [t["function"]["name"] for t in discovered_tools],
                             "signatures": sigs,
                             "found_recipes": list(found_r.keys()),
                             "message": guidance,
