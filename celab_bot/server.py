@@ -358,7 +358,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
             f"Estás interactuando con el usuario Linux '{linux_user}'{' (ADMINISTRADOR)' if is_admin else ''}.\n"
             f"REGLAS DE HERRAMIENTAS:\n"
             f"1. Usa `search_tools` (con `query` EN INGLÉS) siempre que necesites interactuar con archivos, terminal, web o recetas.\n"
-            f"2. Para crear o modificar archivos (`.py`, `.html`, `.css`, `.txt`, configs), usa SIEMPRE `edit_file` (nunca `cat << EOF` en `run_terminal_command`). Usa `run_terminal_command` solo para comandos shell (`ps`, `df`, `git`, ejecutar scripts).\n"
+            f"2. Para crear o modificar archivos (`.py`, `.html`, `.css`, `.txt`, configs), usa SIEMPRE `edit_file` (nunca `cat << EOF` en `run_terminal_command`), escribiendo código limpio y conciso sin comentarios decorativos extensos. Usa `run_terminal_command` solo para comandos shell (`ps`, `df`, `git`, ejecutar scripts).\n"
             f"3. Una vez que `search_tools` desbloquee las herramientas, INVOCA la herramienta adecuada directamente mediante tool call en lugar de solo mostrar el código en texto.\n"
             f"4. Para conversaciones generales, saludos o dudas teóricas que no requieran el sistema, responde directamente en español."
             f"{memory_context}"
@@ -614,8 +614,11 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                             "function": {
                                 "name": c["name"],
                                 "arguments": (
-                                    c["raw_arguments"]
-                                    if c.get("parse_error") and isinstance(c.get("raw_arguments"), str)
+                                    json.dumps(
+                                        {"_truncated_or_invalid": True, "raw_chars": len(c.get("raw_arguments") or "")},
+                                        ensure_ascii=False,
+                                    )
+                                    if c.get("parse_error")
                                     else json.dumps(c["arguments"], ensure_ascii=False)
                                 ),
                             },
@@ -636,7 +639,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     if call.get("parse_error"):
                         tool_res = {
                             "error": call["parse_error"],
-                            "hint": "Use edit_file for files; if content is very long, write a compact version or create it in two smaller edits.",
+                            "hint": "Your previous tool call JSON was too long and got cut off. Retry edit_file NOW with a much more concise version of the file (avoid long comments and redundant CSS), or create a compact skeleton first.",
                         }
                     elif fn_name == "search_tools":
                         query = args.get("query", "")
