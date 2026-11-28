@@ -20,6 +20,9 @@ search_threshold = 0.05
 max_agent_steps = 8
 max_memory_inject = 5
 always_include_terminal_tool = true
+enable_planner = true
+max_plan_steps = 5
+max_substeps_per_plan_step = 4
 
 [paths]
 shared_dir = "/opt/celab-bot/shared"

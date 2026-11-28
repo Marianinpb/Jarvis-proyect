@@ -18,6 +18,14 @@ from celab_bot.core import (
     extract_fallback_tool_calls,
 )
 from celab_bot.memory import UserMemoryStore
+from celab_bot.planner import (
+    agenerate_plan,
+    build_step_messages,
+    build_synthesizer_messages,
+    format_plan_markdown,
+    should_skip_planner,
+    summarize_step_outcome,
+)
 from celab_bot.security import requires_user_confirmation, format_confirmation_request
 from celab_bot.users import get_linux_user, is_admin_user
 
@@ -144,6 +152,43 @@ def _fit_context_budget(
     est_in = _estimate_messages_tokens(trimmed)
     effective_max_tokens = min(desired_max_tokens, max(512, ctx_size - est_in - safety_margin))
     return trimmed, effective_max_tokens
+
+
+def _make_assistant_tool_msg(content_buf: str, normalized_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Construye un mensaje assistant limpio para llama.cpp usando JSON válido incluso si hubo truncado."""
+    return {
+        "role": "assistant",
+        "content": content_buf or "",
+        "tool_calls": [
+            {
+                "id": c["id"],
+                "type": "function",
+                "function": {
+                    "name": c["name"],
+                    "arguments": (
+                        json.dumps(
+                            {"_truncated_or_invalid": True, "raw_chars": len(c.get("raw_arguments") or "")},
+                            ensure_ascii=False,
+                        )
+                        if c.get("parse_error")
+                        else json.dumps(c["arguments"], ensure_ascii=False)
+                    ),
+                },
+            }
+            for c in normalized_calls
+        ],
+    }
+
+
+def _tool_result_succeeded(tool_res: Any) -> bool:
+    """Determina si el resultado de una herramienta fue exitoso."""
+    if not isinstance(tool_res, dict):
+        return True
+    if "error" in tool_res:
+        return False
+    if "returncode" in tool_res and int(tool_res.get("returncode", 0)) != 0:
+        return False
+    return True
 
 
 def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
@@ -368,6 +413,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
         pending = memory_store.get_pending_confirmation(ttl_seconds=900)
         action_executed_info = None
         action_denied_info = None
+        resumed_plan_state = None
 
         if pending:
             intent = check_confirmation_intent(current_query)
@@ -380,6 +426,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     linux_user,
                     is_admin,
                 )
+                resumed_plan_state = pending.get("plan_state")
                 action_executed_info = {
                     "tool_name": pending["tool_name"],
                     "args": pending["args"],
@@ -393,6 +440,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     "tool_name": pending["tool_name"],
                     "description": pending["description"],
                     "quest": pending["quest"],
+                    "plan_state": pending.get("plan_state"),
                 }
             else:
                 memory_store.clear_pending_confirmation()
@@ -446,10 +494,22 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
             else:
                 prepared_messages.append({"role": "user", "content": exec_note})
         elif action_denied_info:
+            plan_ctx_note = ""
+            denied_plan = action_denied_info.get("plan_state")
+            if isinstance(denied_plan, dict):
+                steps = denied_plan.get("steps", [])
+                s_idx = int(denied_plan.get("current_step_idx", 0))
+                rem = [f"{s.get('id')}. {s.get('goal')}" for s in steps[s_idx + 1 :]]
+                rem_txt = "\n".join(rem) if rem else "(ninguno)"
+                plan_ctx_note = (
+                    f"\nEsta acción correspondía al Paso {s_idx + 1}/{len(steps)} del plan.\n"
+                    f"Pasos restantes sin ejecutar:\n{rem_txt}\n"
+                )
             denied_note = (
                 f"\n\n[PERMISO DENEGADO POR EL USUARIO]:\n"
                 f"El usuario DENEGÓ el permiso para ejecutar '{action_denied_info['tool_name']}' ({action_denied_info['description']}).\n"
-                f"La tarea original que intentabas resolver era: '{action_denied_info['quest']}'.\n\n"
+                f"La tarea original que intentabas resolver era: '{action_denied_info['quest']}'.\n"
+                f"{plan_ctx_note}\n"
                 f"INSTRUCCIÓN: Con esta negativa, NO intentes ejecutar esta misma acción otra vez. "
                 f"Evalúa si puedes resolver la tarea con una alternativa viable que no requiera esa acción destructiva, "
                 f"o explica al usuario con amabilidad qué se requería y pregúntale cómo desea proceder."
@@ -476,12 +536,174 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     clean.append(item)
             return clean
 
+        async def _stream_llm_turn(
+            conv_msgs: List[Dict[str, Any]],
+            tools: Optional[List[Dict[str, Any]]],
+            stream_text_live: bool = True,
+            step_label: str = "direct",
+        ) -> AsyncGenerator[Tuple[str, Any], None]:
+            content_buf = ""
+            streamed_live = False
+            aborted_loop = False
+            finish_reason = None
+            tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+
+            budgeted_messages, effective_max_tokens = _fit_context_budget(
+                conv_msgs,
+                config.llm_ctx_size,
+                config.llm_max_tokens,
+            )
+
+            llm_kwargs: Dict[str, Any] = {
+                "model": config.llm_model,
+                "messages": budgeted_messages,
+                "max_tokens": effective_max_tokens,
+                "temperature": config.llm_temperature,
+                "stream": True,
+                "extra_body": {"repeat_penalty": config.llm_repeat_penalty},
+            }
+            if tools:
+                llm_kwargs["tools"] = tools
+                llm_kwargs["tool_choice"] = "auto"
+
+            try:
+                llm_stream = await llm_client.chat.completions.create(**llm_kwargs)
+                async for chunk in llm_stream:
+                    if await request.is_disconnected():
+                        await llm_stream.close()
+                        yield ("disconnected", None)
+                        return
+
+                    if not chunk.choices:
+                        continue
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+                    delta = chunk.choices[0].delta
+
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index if tc_delta.index is not None else 0
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.id or f"call_{uuid.uuid4().hex[:10]}",
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                            if tc_delta.id:
+                                tool_calls_acc[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_acc[idx]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+                                    if detect_repetition_loop(tool_calls_acc[idx]["arguments"]):
+                                        aborted_loop = True
+                                        print(f"⚠️ [BONSAI GUARD] Bucle de repetición en argumentos ({step_label}). Abortando stream.")
+                                        await llm_stream.close()
+                                        break
+                        if aborted_loop:
+                            break
+
+                    if delta.content:
+                        content_buf += delta.content
+                        if detect_repetition_loop(content_buf):
+                            aborted_loop = True
+                            print(f"⚠️ [BONSAI GUARD] Bucle de repetición en texto ({step_label}). Abortando stream.")
+                            await llm_stream.close()
+                            break
+
+                        if stream_text_live and not tool_calls_acc:
+                            if streamed_live:
+                                yield ("sse", sse_chunk(delta.content))
+                            elif len(content_buf) >= 24 and not _looks_like_raw_tool_prefix(content_buf):
+                                streamed_live = True
+                                yield ("sse", sse_chunk(content_buf))
+
+            except Exception as err:
+                yield ("error", str(err))
+                return
+
+            normalized_calls: List[Dict[str, Any]] = []
+            for idx in sorted(tool_calls_acc.keys()):
+                tc_item = tool_calls_acc[idx]
+                fn_name = tc_item["name"].strip()
+                raw_args = tc_item["arguments"]
+                parse_error: Optional[str] = None
+                parsed_args: Dict[str, Any] = {}
+
+                if not raw_args or not raw_args.strip():
+                    parse_error = (
+                        f"Missing or empty JSON arguments for '{fn_name}' "
+                        f"(finish_reason={finish_reason})."
+                    )
+                else:
+                    try:
+                        loaded = json.loads(raw_args)
+                        if isinstance(loaded, dict):
+                            parsed_args = loaded
+                        else:
+                            parse_error = f"Tool arguments for '{fn_name}' must be a JSON object."
+                    except Exception as je:
+                        trunc_note = " (truncated at max_tokens limit)" if finish_reason == "length" else ""
+                        parse_error = (
+                            f"Malformed/truncated JSON arguments for '{fn_name}'{trunc_note}: {je}."
+                        )
+
+                if not parse_error:
+                    if fn_name == "run_terminal_command" and not (parsed_args.get("command") or "").strip():
+                        parse_error = (
+                            "Missing or empty 'command' argument (likely truncated). "
+                            "If creating a file, use edit_file instead of run_terminal_command."
+                        )
+                    elif fn_name == "edit_file" and not (parsed_args.get("path") or "").strip():
+                        parse_error = "Missing or empty 'path' argument (likely truncated)."
+
+                if fn_name:
+                    normalized_calls.append({
+                        "id": tc_item["id"],
+                        "name": fn_name,
+                        "arguments": parsed_args,
+                        "raw_arguments": raw_args,
+                        "parse_error": parse_error,
+                    })
+
+            if not normalized_calls and not streamed_live and tools:
+                fallback_calls = extract_fallback_tool_calls(content_buf, tools)
+                if fallback_calls:
+                    print(f"🩹 [FALLBACK PARSER] Rescatadas {len(fallback_calls)} tool calls desde texto plano ({step_label}).")
+                    normalized_calls = fallback_calls
+                    content_buf = ""
+
+            yield ("done", {
+                "content": content_buf,
+                "tool_calls": normalized_calls,
+                "streamed_live": streamed_live,
+                "aborted_loop": aborted_loop,
+                "finish_reason": finish_reason,
+            })
+
+        async def _discover_tools(
+            query: str,
+            core_tools: List[Dict[str, Any]],
+            discovered_tools: List[Dict[str, Any]],
+        ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+            found_t, found_r = await engine.asearch_tools(query, linux_user, memory_store)
+            existing_names = {t["function"]["name"] for t in core_tools + discovered_tools}
+            for ft in found_t:
+                t_name = ft["function"]["name"]
+                if t_name not in existing_names:
+                    discovered_tools.append(ft)
+                    existing_names.add(t_name)
+            if config.always_include_terminal_tool and "run_terminal_command" not in existing_names:
+                discovered_tools.append(engine.tools_registry.get_terminal_tool())
+                existing_names.add("run_terminal_command")
+            sigs = _summarize_tool_signatures(discovered_tools)
+            return list(core_tools) + discovered_tools, found_r, sigs
+
         async def response_generator() -> AsyncGenerator[str, None]:
-            discovered_tools: List[Dict[str, Any]] = []
             core_tools = engine.tools_registry.get_core_tools(include_terminal=False)
-            active_tools: Optional[List[Dict[str, Any]]] = None if action_executed_info else list(core_tools)
-            conversation_history: List[Dict[str, Any]] = sanitize_for_llm(list(filtered_msgs))
-            final_assistant_text = ""
+            active_plan_state: Optional[Dict[str, Any]] = None
+            step_recovery_note = ""
 
             if action_executed_info:
                 t_name = action_executed_info["tool_name"]
@@ -495,150 +717,290 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     f"```json\n{preview}\n```\n"
                     f"</details>\n\n"
                 )
+                if isinstance(resumed_plan_state, dict):
+                    active_plan_state = resumed_plan_state
+                    s_idx = int(active_plan_state.get("current_step_idx", 0))
+                    steps = active_plan_state.get("steps", [])
+                    if 0 <= s_idx < len(steps):
+                        cur_step = steps[s_idx]
+                        if _tool_result_succeeded(t_res):
+                            summary = summarize_step_outcome(
+                                cur_step.get("goal", ""),
+                                "",
+                                [{"tool": t_name, "result": t_res}],
+                            )
+                            active_plan_state.setdefault("completed_steps", []).append({
+                                "id": cur_step.get("id", s_idx + 1),
+                                "goal": cur_step.get("goal", ""),
+                                "summary": summary,
+                            })
+                            active_plan_state["current_step_idx"] = s_idx + 1
+                            yield sse_chunk(
+                                f"\n<details><summary>✅ <b>Paso {s_idx + 1}/{len(steps)} completado:</b> {cur_step.get('goal', '')}</summary>\n\n"
+                                f"{summary}\n</details>\n\n"
+                            )
+                        else:
+                            step_recovery_note = (
+                                f"La herramienta autorizada '{t_name}' devolvió un error o código distinto de 0:\n"
+                                f"{json.dumps(t_res, ensure_ascii=False)[:1000]}\n"
+                                f"Diagnostica o corrige este paso antes de continuar."
+                            )
             elif action_denied_info:
                 t_desc = action_denied_info["description"]
                 yield sse_chunk(f"\n> 🚫 **Acción cancelada:** No se ejecutó {t_desc}.\n\n")
-
-            for step_idx in range(config.max_agent_steps):
-                # 1. Llamar al LLM en modo streaming real con guardrails contra cuelgues
-                content_buf = ""
-                streamed_live = False
-                aborted_loop = False
-                finish_reason = None
-                tool_calls_acc: Dict[int, Dict[str, Any]] = {}
-
-                budgeted_messages, effective_max_tokens = _fit_context_budget(
-                    conversation_history,
-                    config.llm_ctx_size,
-                    config.llm_max_tokens,
+            elif config.enable_planner and not should_skip_planner(current_query):
+                plan_result = await agenerate_plan(
+                    llm_client,
+                    config,
+                    current_query,
+                    cleaned_messages,
+                    memory_context,
                 )
+                if plan_result.get("mode") == "plan" and len(plan_result.get("steps", [])) >= 2:
+                    active_plan_state = {
+                        "original_quest": current_query,
+                        "steps": plan_result["steps"],
+                        "current_step_idx": 0,
+                        "completed_steps": [],
+                    }
+                    yield sse_chunk(format_plan_markdown(active_plan_state))
 
-                llm_kwargs: Dict[str, Any] = {
-                    "model": config.llm_model,
-                    "messages": budgeted_messages,
-                    "max_tokens": effective_max_tokens,
-                    "temperature": config.llm_temperature,
-                    "stream": True,
-                    "extra_body": {"repeat_penalty": config.llm_repeat_penalty},
-                }
-                if active_tools:
-                    llm_kwargs["tools"] = active_tools
-                    llm_kwargs["tool_choice"] = "auto"
+            # ─────────────────────────────────────────────────────────────────
+            # MODO PLAN-AND-EXECUTE (CONTEXTO MÍNIMO AISLADO POR PASO)
+            # ─────────────────────────────────────────────────────────────────
+            if active_plan_state is not None:
+                steps = active_plan_state.get("steps", [])
+                total_steps = len(steps)
 
-                try:
-                    llm_stream = await llm_client.chat.completions.create(**llm_kwargs)
-                    async for chunk in llm_stream:
-                        if await request.is_disconnected():
-                            await llm_stream.close()
+                while active_plan_state["current_step_idx"] < total_steps:
+                    s_idx = active_plan_state["current_step_idx"]
+                    cur_step = steps[s_idx]
+                    step_goal = cur_step.get("goal", "")
+                    step_label = f"paso {s_idx + 1}/{total_steps}"
+
+                    step_messages = build_step_messages(
+                        linux_user,
+                        is_admin,
+                        memory_context,
+                        active_plan_state,
+                        s_idx,
+                        recovery_note=step_recovery_note,
+                    )
+                    step_recovery_note = ""
+
+                    step_discovered: List[Dict[str, Any]] = []
+                    step_active_tools: Optional[List[Dict[str, Any]]] = None
+                    if cur_step.get("needs_tools", True):
+                        t_query = cur_step.get("tool_query", "")
+                        if t_query:
+                            step_active_tools, _, _ = await _discover_tools(
+                                t_query, core_tools, step_discovered
+                            )
+                        else:
+                            if config.always_include_terminal_tool:
+                                step_discovered.append(engine.tools_registry.get_terminal_tool())
+                            step_active_tools = list(core_tools) + step_discovered
+
+                    step_tool_results: List[Dict[str, Any]] = []
+                    step_final_text = ""
+
+                    for _sub_idx in range(config.max_substeps_per_plan_step):
+                        turn_done = None
+                        disconnected = False
+                        turn_err = None
+                        async for ev_type, ev_val in _stream_llm_turn(
+                            step_messages,
+                            step_active_tools,
+                            stream_text_live=False,
+                            step_label=step_label,
+                        ):
+                            if ev_type == "disconnected":
+                                disconnected = True
+                                break
+                            elif ev_type == "error":
+                                turn_err = ev_val
+                                break
+                            elif ev_type == "done":
+                                turn_done = ev_val
+
+                        if disconnected:
+                            return
+                        if turn_err is not None:
+                            yield sse_chunk(f"\n❌ Error al comunicarse con el modelo local ({step_label}): {turn_err}\n")
+                            yield sse_chunk("", finish_reason="stop")
+                            yield "data: [DONE]\n\n"
                             return
 
-                        if not chunk.choices:
-                            continue
-                        if chunk.choices[0].finish_reason:
-                            finish_reason = chunk.choices[0].finish_reason
-                        delta = chunk.choices[0].delta
+                        normalized_calls = turn_done["tool_calls"]
+                        if not normalized_calls:
+                            step_final_text = turn_done["content"]
+                            break
 
-                        # Acumular tool_calls en streaming
-                        if delta.tool_calls:
-                            for tc_delta in delta.tool_calls:
-                                idx = tc_delta.index if tc_delta.index is not None else 0
-                                if idx not in tool_calls_acc:
-                                    tool_calls_acc[idx] = {
-                                        "id": tc_delta.id or f"call_{uuid.uuid4().hex[:10]}",
-                                        "name": "",
-                                        "arguments": "",
-                                    }
-                                if tc_delta.id:
-                                    tool_calls_acc[idx]["id"] = tc_delta.id
-                                if tc_delta.function:
-                                    if tc_delta.function.name:
-                                        tool_calls_acc[idx]["name"] += tc_delta.function.name
-                                    if tc_delta.function.arguments:
-                                        tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
-                                        if detect_repetition_loop(tool_calls_acc[idx]["arguments"]):
-                                            aborted_loop = True
-                                            print(f"⚠️ [BONSAI GUARD] Bucle de repetición en argumentos de tool en paso {step_idx + 1}. Abortando stream.")
-                                            await llm_stream.close()
-                                            break
-                            if aborted_loop:
-                                break
+                        step_messages.append(_make_assistant_tool_msg(turn_done["content"], normalized_calls))
 
-                        # Acumular y transmitir contenido textual
-                        if delta.content:
-                            content_buf += delta.content
-                            if detect_repetition_loop(content_buf):
-                                aborted_loop = True
-                                print(f"⚠️ [BONSAI GUARD] Bucle de repetición detectado en paso {step_idx + 1}. Abortando stream.")
-                                await llm_stream.close()
-                                break
+                        for call in normalized_calls:
+                            fn_name = call["name"]
+                            args = call["arguments"]
+                            tc_id = call["id"]
 
-                            if not tool_calls_acc:
-                                if streamed_live:
-                                    yield sse_chunk(delta.content)
-                                elif len(content_buf) >= 24 and not _looks_like_raw_tool_prefix(content_buf):
-                                    streamed_live = True
-                                    yield sse_chunk(content_buf)
+                            yield sse_chunk(f"\n<details><summary>🛠️ <i>[{step_label}] Herramienta: <code>{fn_name}</code></i></summary>\n\n")
 
-                except Exception as err:
-                    yield sse_chunk(f"\n❌ Error al comunicarse con el modelo local: {err}\n")
+                            if call.get("parse_error"):
+                                tool_res = {
+                                    "error": call["parse_error"],
+                                    "hint": "Your previous tool call JSON was too long and got cut off. Retry edit_file NOW with a much more concise version of the file (avoid long comments and redundant CSS), or create a compact skeleton first.",
+                                }
+                            elif fn_name == "search_tools":
+                                query = args.get("query", "")
+                                step_active_tools, found_r, sigs = await _discover_tools(
+                                    query, core_tools, step_discovered
+                                )
+                                guidance = (
+                                    f"Tools unlocked and ready to call now: {', '.join(sigs)}. CALL the appropriate tool now."
+                                    if (step_discovered or found_r)
+                                    else "No specialized tool matched. Answer directly or refine your English search query."
+                                )
+                                tool_res = {
+                                    "found_tools": [t["function"]["name"] for t in step_discovered],
+                                    "signatures": sigs,
+                                    "found_recipes": list(found_r.keys()),
+                                    "message": guidance,
+                                }
+                            else:
+                                req_confirm, desc = requires_user_confirmation(fn_name, args)
+                                if req_confirm and config.require_confirmation:
+                                    memory_store.set_pending_confirmation(
+                                        tool_name=fn_name,
+                                        args=args,
+                                        description=desc,
+                                        quest=f"Paso {s_idx + 1}/{total_steps}: {step_goal}",
+                                        plan_state=active_plan_state,
+                                    )
+                                    confirm_text = format_confirmation_request(
+                                        tc_id,
+                                        fn_name,
+                                        desc,
+                                        f"Paso {s_idx + 1}/{total_steps}: {step_goal}",
+                                    )
+                                    yield sse_chunk(f"⏳ <i>Esperando autorización del usuario...</i>\n</details>\n\n{confirm_text}\n\n")
+                                    yield sse_chunk("", finish_reason="stop")
+                                    yield "data: [DONE]\n\n"
+                                    return
+
+                                tool_res = await asyncio.to_thread(
+                                    engine.execute_tool, fn_name, args, linux_user, is_admin
+                                )
+                                step_tool_results.append({"tool": fn_name, "result": tool_res})
+
+                            res_str = json.dumps(tool_res, ensure_ascii=False, indent=2)
+                            preview = (res_str[:400] + "...") if len(res_str) > 400 else res_str
+                            yield sse_chunk(f"```json\n{preview}\n```\n</details>\n\n")
+
+                            step_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": json.dumps(tool_res, ensure_ascii=False),
+                            })
+
+                    summary = summarize_step_outcome(step_goal, step_final_text, step_tool_results)
+                    active_plan_state.setdefault("completed_steps", []).append({
+                        "id": cur_step.get("id", s_idx + 1),
+                        "goal": step_goal,
+                        "summary": summary,
+                    })
+                    active_plan_state["current_step_idx"] = s_idx + 1
+                    yield sse_chunk(
+                        f"\n<details><summary>✅ <b>Paso {s_idx + 1}/{total_steps} completado:</b> {step_goal}</summary>\n\n"
+                        f"{summary}\n</details>\n\n"
+                    )
+
+                # Fase 3 — Synthesizer
+                synth_msgs = build_synthesizer_messages(
+                    linux_user, is_admin, memory_context, active_plan_state
+                )
+                synth_done = None
+                async for ev_type, ev_val in _stream_llm_turn(
+                    synth_msgs,
+                    tools=None,
+                    stream_text_live=True,
+                    step_label="synthesizer",
+                ):
+                    if ev_type == "sse":
+                        yield ev_val
+                    elif ev_type == "disconnected":
+                        return
+                    elif ev_type == "error":
+                        yield sse_chunk(f"\n❌ Error al sintetizar respuesta final: {ev_val}\n")
+                        yield sse_chunk("", finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif ev_type == "done":
+                        synth_done = ev_val
+
+                if synth_done:
+                    if not synth_done["streamed_live"] and synth_done["content"]:
+                        yield sse_chunk(synth_done["content"])
+                    if synth_done["aborted_loop"]:
+                        yield sse_chunk("\n\n*(Respuesta truncada automáticamente al detectar repetición del modelo local.)*")
+                    elif synth_done["finish_reason"] == "length":
+                        yield sse_chunk("\n\n*(Salida alcanzó el límite de tokens por turno; pídeme continuar si faltó una parte.)*")
+                    final_synth_text = synth_done["content"]
+                    yield sse_chunk("", finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+
+                    if final_synth_text.strip():
+                        asyncio.create_task(
+                            engine.aclassify_and_store_turn(
+                                active_plan_state.get("original_quest", current_query),
+                                final_synth_text,
+                                memory_store,
+                            )
+                        )
+                return
+
+            # ─────────────────────────────────────────────────────────────────
+            # MODO DIRECTO (SIN PLAN MULTI-PASO)
+            # ─────────────────────────────────────────────────────────────────
+            discovered_tools: List[Dict[str, Any]] = []
+            active_tools: Optional[List[Dict[str, Any]]] = None if action_executed_info else list(core_tools)
+            conversation_history: List[Dict[str, Any]] = sanitize_for_llm(list(filtered_msgs))
+            final_assistant_text = ""
+
+            for step_idx in range(config.max_agent_steps):
+                turn_done = None
+                disconnected = False
+                turn_err = None
+                async for ev_type, ev_val in _stream_llm_turn(
+                    conversation_history,
+                    active_tools,
+                    stream_text_live=True,
+                    step_label=f"direct-{step_idx + 1}",
+                ):
+                    if ev_type == "sse":
+                        yield ev_val
+                    elif ev_type == "disconnected":
+                        disconnected = True
+                        break
+                    elif ev_type == "error":
+                        turn_err = ev_val
+                        break
+                    elif ev_type == "done":
+                        turn_done = ev_val
+
+                if disconnected:
+                    return
+                if turn_err is not None:
+                    yield sse_chunk(f"\n❌ Error al comunicarse con el modelo local: {turn_err}\n")
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     return
 
-                # Normalizar tool calls nativas y validar argumentos antes de confirmar/ejecutar
-                normalized_calls: List[Dict[str, Any]] = []
-                for idx in sorted(tool_calls_acc.keys()):
-                    tc_item = tool_calls_acc[idx]
-                    fn_name = tc_item["name"].strip()
-                    raw_args = tc_item["arguments"]
-                    parse_error: Optional[str] = None
-                    parsed_args: Dict[str, Any] = {}
+                normalized_calls = turn_done["tool_calls"]
+                content_buf = turn_done["content"]
+                streamed_live = turn_done["streamed_live"]
+                aborted_loop = turn_done["aborted_loop"]
+                finish_reason = turn_done["finish_reason"]
 
-                    if not raw_args or not raw_args.strip():
-                        parse_error = (
-                            f"Missing or empty JSON arguments for '{fn_name}' "
-                            f"(finish_reason={finish_reason})."
-                        )
-                    else:
-                        try:
-                            loaded = json.loads(raw_args)
-                            if isinstance(loaded, dict):
-                                parsed_args = loaded
-                            else:
-                                parse_error = f"Tool arguments for '{fn_name}' must be a JSON object."
-                        except Exception as je:
-                            trunc_note = " (truncated at max_tokens limit)" if finish_reason == "length" else ""
-                            parse_error = (
-                                f"Malformed/truncated JSON arguments for '{fn_name}'{trunc_note}: {je}."
-                            )
-
-                    if not parse_error:
-                        if fn_name == "run_terminal_command" and not (parsed_args.get("command") or "").strip():
-                            parse_error = (
-                                "Missing or empty 'command' argument (likely truncated). "
-                                "If creating a file, use edit_file instead of run_terminal_command."
-                            )
-                        elif fn_name == "edit_file" and not (parsed_args.get("path") or "").strip():
-                            parse_error = "Missing or empty 'path' argument (likely truncated)."
-
-                    if fn_name:
-                        normalized_calls.append({
-                            "id": tc_item["id"],
-                            "name": fn_name,
-                            "arguments": parsed_args,
-                            "raw_arguments": raw_args,
-                            "parse_error": parse_error,
-                        })
-
-                # Fallback: si llama.cpp no parseó tool_calls pero el modelo escribió <tool_call>/JSON en content
-                if not normalized_calls and not streamed_live and active_tools:
-                    fallback_calls = extract_fallback_tool_calls(content_buf, active_tools)
-                    if fallback_calls:
-                        print(f"🩹 [FALLBACK PARSER] Rescatadas {len(fallback_calls)} tool calls desde texto plano.")
-                        normalized_calls = fallback_calls
-                        content_buf = ""
-
-                # Si NO hay tool calls, cerrar respuesta final
                 if not normalized_calls:
                     if not streamed_live and content_buf:
                         yield sse_chunk(content_buf)
@@ -650,39 +1012,14 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     yield sse_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
 
-                    # Clasificar y almacenar el turno recién completado en SQLite en segundo plano
                     if not action_executed_info and not action_denied_info and final_assistant_text.strip():
                         asyncio.create_task(
                             engine.aclassify_and_store_turn(current_query, final_assistant_text, memory_store)
                         )
                     return
 
-                # Registrar mensaje del asistente como dict limpio (evita fallos de plantilla Jinja en llama.cpp)
-                assistant_msg: Dict[str, Any] = {
-                    "role": "assistant",
-                    "content": content_buf or "",
-                    "tool_calls": [
-                        {
-                            "id": c["id"],
-                            "type": "function",
-                            "function": {
-                                "name": c["name"],
-                                "arguments": (
-                                    json.dumps(
-                                        {"_truncated_or_invalid": True, "raw_chars": len(c.get("raw_arguments") or "")},
-                                        ensure_ascii=False,
-                                    )
-                                    if c.get("parse_error")
-                                    else json.dumps(c["arguments"], ensure_ascii=False)
-                                ),
-                            },
-                        }
-                        for c in normalized_calls
-                    ],
-                }
-                conversation_history.append(assistant_msg)
+                conversation_history.append(_make_assistant_tool_msg(content_buf, normalized_calls))
 
-                # Procesar cada tool call
                 for call in normalized_calls:
                     fn_name = call["name"]
                     args = call["arguments"]
@@ -697,19 +1034,9 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                         }
                     elif fn_name == "search_tools":
                         query = args.get("query", "")
-                        found_t, found_r = await engine.asearch_tools(query, linux_user, memory_store)
-                        existing_names = {t["function"]["name"] for t in core_tools + discovered_tools}
-                        for ft in found_t:
-                            t_name = ft["function"]["name"]
-                            if t_name not in existing_names:
-                                discovered_tools.append(ft)
-                                existing_names.add(t_name)
-                        if config.always_include_terminal_tool and "run_terminal_command" not in existing_names:
-                            discovered_tools.append(engine.tools_registry.get_terminal_tool())
-                            existing_names.add("run_terminal_command")
-                        active_tools = list(core_tools) + discovered_tools
-
-                        sigs = _summarize_tool_signatures(discovered_tools)
+                        active_tools, found_r, sigs = await _discover_tools(
+                            query, core_tools, discovered_tools
+                        )
                         if discovered_tools or found_r:
                             guidance = (
                                 f"Tools unlocked and ready to call now: {', '.join(sigs)}. "
@@ -755,7 +1082,6 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                         "content": json.dumps(tool_res, ensure_ascii=False),
                     })
 
-            # Si se alcanzó el límite máximo de pasos agénticos
             yield sse_chunk(
                 f"\n⚠️ Se alcanzó el límite máximo de pasos ({config.max_agent_steps}) para esta consulta. "
                 f"Indícame si deseas que continúe con un paso específico."

@@ -34,6 +34,9 @@ class CelabConfig:
     max_agent_steps: int = 8
     max_memory_inject: int = 5
     always_include_terminal_tool: bool = True
+    enable_planner: bool = True
+    max_plan_steps: int = 5
+    max_substeps_per_plan_step: int = 4
 
     # System Paths
     shared_dir: Path = Path("/opt/celab-bot/shared")
@@ -96,6 +99,11 @@ def load_config(config_path: Optional[str] = None) -> CelabConfig:
             cfg.always_include_terminal_tool = bool(
                 agent.get("always_include_terminal_tool", cfg.always_include_terminal_tool)
             )
+            cfg.enable_planner = bool(agent.get("enable_planner", cfg.enable_planner))
+            cfg.max_plan_steps = int(agent.get("max_plan_steps", cfg.max_plan_steps))
+            cfg.max_substeps_per_plan_step = int(
+                agent.get("max_substeps_per_plan_step", cfg.max_substeps_per_plan_step)
+            )
 
             paths = data.get("paths", {})
             if "shared_dir" in paths:
@@ -123,6 +131,8 @@ def load_config(config_path: Optional[str] = None) -> CelabConfig:
         cfg.api_key = os.environ["CELAB_API_KEY"]
     if os.environ.get("CELAB_SINGLE_USER"):
         cfg.single_user_mode = os.environ["CELAB_SINGLE_USER"].lower() in ("1", "true", "yes")
+    if os.environ.get("CELAB_ENABLE_PLANNER"):
+        cfg.enable_planner = os.environ["CELAB_ENABLE_PLANNER"].lower() in ("1", "true", "yes")
 
     # Si /opt/celab-bot no existe y estamos en dev local, usar ./shared
     if not cfg.shared_dir.exists() and Path("./shared").exists():
