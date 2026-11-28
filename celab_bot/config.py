@@ -18,7 +18,8 @@ class CelabConfig:
     llm_base_url: str = "http://localhost:3000/v1"
     llm_model: str = "Bonsai-27b-Q1_0"
     llm_api_key: str = "no-key-needed"
-    llm_timeout: float = 90.0
+    llm_timeout: float = 180.0
+    llm_ctx_size: int = 65536
     llm_max_tokens: int = 8192
     llm_temperature: float = 0.2
     llm_repeat_penalty: float = 1.1
@@ -78,6 +79,7 @@ def load_config(config_path: Optional[str] = None) -> CelabConfig:
             cfg.llm_model = llm.get("model", cfg.llm_model)
             cfg.llm_api_key = llm.get("api_key", cfg.llm_api_key)
             cfg.llm_timeout = float(llm.get("timeout", cfg.llm_timeout))
+            cfg.llm_ctx_size = int(llm.get("ctx_size", cfg.llm_ctx_size))
             cfg.llm_max_tokens = int(llm.get("max_tokens", cfg.llm_max_tokens))
             cfg.llm_temperature = float(llm.get("temperature", cfg.llm_temperature))
             cfg.llm_repeat_penalty = float(llm.get("repeat_penalty", cfg.llm_repeat_penalty))
@@ -115,6 +117,8 @@ def load_config(config_path: Optional[str] = None) -> CelabConfig:
         cfg.llm_base_url = os.environ["CELAB_LLM_URL"]
     if os.environ.get("CELAB_LLM_MODEL"):
         cfg.llm_model = os.environ["CELAB_LLM_MODEL"]
+    if os.environ.get("CELAB_LLM_CTX_SIZE"):
+        cfg.llm_ctx_size = int(os.environ["CELAB_LLM_CTX_SIZE"])
     if os.environ.get("CELAB_API_KEY"):
         cfg.api_key = os.environ["CELAB_API_KEY"]
     if os.environ.get("CELAB_SINGLE_USER"):

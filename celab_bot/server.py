@@ -3,7 +3,7 @@ import json
 import re
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,6 +101,51 @@ def _summarize_tool_signatures(tools: List[Dict[str, Any]]) -> List[str]:
     return sigs
 
 
+def _estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Estima de forma conservadora el total de tokens para respetar ctx_size en llama-server."""
+    total_chars = 0
+    for m in messages:
+        if isinstance(m, dict):
+            total_chars += len(json.dumps(m, ensure_ascii=False))
+        else:
+            total_chars += len(str(m))
+    return total_chars // 3 + len(messages) * 8 + 64
+
+
+def _fit_context_budget(
+    messages: List[Dict[str, Any]],
+    ctx_size: int,
+    desired_max_tokens: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Recorta historial intermedio más antiguo si excede ctx_size y ajusta max_tokens efectivos."""
+    safety_margin = 512
+    if not messages:
+        effective = min(desired_max_tokens, max(512, ctx_size - safety_margin))
+        return [], effective
+
+    last_user_idx = len(messages) - 1
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role == "user":
+            last_user_idx = i
+            break
+
+    system_head = [messages[0]] if last_user_idx > 0 else []
+    middle = list(messages[1:last_user_idx]) if last_user_idx > 1 else []
+    active_tail = list(messages[last_user_idx:])
+
+    min_reply_reserve = min(desired_max_tokens, 2048)
+    trimmed = system_head + middle + active_tail
+    while middle and (_estimate_messages_tokens(trimmed) + min_reply_reserve + safety_margin > ctx_size):
+        middle.pop(0)
+        trimmed = system_head + middle + active_tail
+
+    est_in = _estimate_messages_tokens(trimmed)
+    effective_max_tokens = min(desired_max_tokens, max(512, ctx_size - est_in - safety_margin))
+    return trimmed, effective_max_tokens
+
+
 def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
 
     config = config or load_config()
@@ -166,6 +211,8 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
             "status": "healthy",
             "model": config.llm_model,
             "backend": config.llm_base_url,
+            "ctx_size": config.llm_ctx_size,
+            "max_tokens": config.llm_max_tokens,
             "laya_loaded": tool_router is not None and context_router is not None,
         }
 
@@ -183,6 +230,7 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                     "permission": [],
                     "root": "celab-bot",
                     "parent": None,
+                    "context_length": config.llm_ctx_size,
                 }
             ],
         }
@@ -459,10 +507,16 @@ def create_app(config: Optional[CelabConfig] = None) -> FastAPI:
                 finish_reason = None
                 tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
+                budgeted_messages, effective_max_tokens = _fit_context_budget(
+                    conversation_history,
+                    config.llm_ctx_size,
+                    config.llm_max_tokens,
+                )
+
                 llm_kwargs: Dict[str, Any] = {
                     "model": config.llm_model,
-                    "messages": conversation_history,
-                    "max_tokens": config.llm_max_tokens,
+                    "messages": budgeted_messages,
+                    "max_tokens": effective_max_tokens,
                     "temperature": config.llm_temperature,
                     "stream": True,
                     "extra_body": {"repeat_penalty": config.llm_repeat_penalty},

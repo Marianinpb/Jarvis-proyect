@@ -274,8 +274,9 @@ class AgentEngine:
         current_task_en = await self.aget_text_en(current_task, memory_store)
         filtered = [messages[0]]  # System prompt
 
-        # Acotar evaluación a los últimos 16 mensajes previos para evitar latencia en chats muy largos
-        start_idx = max(1, last_user_idx - 16)
+        # Acotar evaluación según el tamaño de contexto configurado (evita latencia en chats largos)
+        history_window = 32 if self.config.llm_ctx_size >= 32768 else 16
+        start_idx = max(1, last_user_idx - history_window)
         i = start_idx
         while i < last_user_idx:
             msg = messages[i]
@@ -621,10 +622,11 @@ class AgentEngine:
             try:
                 with open(target, "r", encoding="utf-8") as f:
                     data = f.read()
-                # Truncar lecturas enormes para proteger la ventana de contexto de Bonsai
-                if len(data) > 12000:
+                # Truncar lecturas enormes de forma proporcional al ctx_size configurado
+                max_read_chars = min(60000, max(12000, self.config.llm_ctx_size))
+                if len(data) > max_read_chars:
                     return {
-                        "content": data[:12000],
+                        "content": data[:max_read_chars],
                         "truncated": True,
                         "total_chars": len(data),
                     }
@@ -761,10 +763,12 @@ class AgentEngine:
                 )
                 stdout = res.stdout or ""
                 stderr = res.stderr or ""
-                if len(stdout) > 8000:
-                    stdout = stdout[:8000] + "\n... [salida truncada]"
-                if len(stderr) > 4000:
-                    stderr = stderr[:4000] + "\n... [stderr truncado]"
+                max_stdout_chars = min(32000, max(8000, self.config.llm_ctx_size // 2))
+                max_stderr_chars = min(12000, max(4000, self.config.llm_ctx_size // 6))
+                if len(stdout) > max_stdout_chars:
+                    stdout = stdout[:max_stdout_chars] + "\n... [salida truncada]"
+                if len(stderr) > max_stderr_chars:
+                    stderr = stderr[:max_stderr_chars] + "\n... [stderr truncado]"
                 return {
                     "stdout": stdout,
                     "stderr": stderr,

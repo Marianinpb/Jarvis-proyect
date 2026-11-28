@@ -4,7 +4,8 @@
 base_url = "http://localhost:3000/v1"
 model = "Bonsai-27b-Q1_0"
 api_key = "no-key-needed"
-timeout = 90.0
+timeout = 180.0
+ctx_size = 65536  # Ventana de contexto de llama-server (con KV-cache Q8_0)
 max_tokens = 8192
 temperature = 0.2
 repeat_penalty = 1.1
